@@ -1,0 +1,25 @@
+# Credentials and secrets — never commit these
+google_credentials.json
+*.json
+.env
+*credentials*
+*password*
+*secret*
+
+# Email alert — contains hardcoded Gmail app password (move to .env first)
+email_alert.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS metadata
+.DS_Store
+
+# Log files
+*.log
+
+# Generated output files
+dashboard.html
+analysis_results.csv
