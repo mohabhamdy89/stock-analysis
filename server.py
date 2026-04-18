@@ -6,7 +6,7 @@ streams real-time updates, and generates Portfolio Advisor recommendations.
 """
 import json, os, sys, threading
 from datetime import datetime
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stock_analysis import (
@@ -14,6 +14,8 @@ from stock_analysis import (
     read_portfolio_sheet, enrich_with_portfolio, generate_advisor_recs,
     generate_dashboard, fetch_benchmark_returns,
 )
+from radar import get_all_radar, get_radar_stock, load_watchlist, save_watchlist
+from radar_ui import RADAR_CSS, RADAR_JS, RADAR_HTML
 
 app = Flask(__name__)
 
@@ -151,6 +153,41 @@ def api_refresh():
         stream(), mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Radar routes ───────────────────────────────────────────────────────────────
+
+@app.route("/api/radar/data")
+def api_radar_data():
+    force   = request.args.get("force") == "1"
+    tickers = load_watchlist()
+    stocks  = get_all_radar(tickers, force=force)
+    return jsonify({"stocks": stocks})
+
+
+@app.route("/api/radar/watchlist", methods=["GET", "POST"])
+def api_radar_watchlist():
+    if request.method == "GET":
+        return jsonify({"tickers": load_watchlist()})
+    body   = request.get_json(force=True, silent=True) or {}
+    action = body.get("action", "")
+    ticker = (body.get("ticker") or "").upper().strip()
+    tickers = load_watchlist()
+    if action == "add" and ticker and ticker not in tickers:
+        if len(tickers) < 25:
+            tickers.append(ticker)
+            save_watchlist(tickers)
+    elif action == "remove" and ticker in tickers:
+        tickers.remove(ticker)
+        save_watchlist(tickers)
+    return jsonify({"tickers": tickers})
+
+
+@app.route("/api/radar/stock/<ticker>")
+def api_radar_stock(ticker):
+    force = request.args.get("force") == "1"
+    data  = get_radar_stock(ticker.upper(), force=force)
+    return jsonify(data)
 
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
@@ -300,7 +337,7 @@ thead th.s.desc::after{content:' ▼';opacity:1;color:#3b82f6;font-size:.8em}
 thead th.s.asc::after{content:' ▲';opacity:1;color:#3b82f6;font-size:.8em}
 thead th.s.desc,thead th.s.asc{color:#475569}
 @media(max-width:900px){.hdr{padding:14px 16px;flex-direction:column;gap:8px}.main{padding:16px}.pstrip{flex-wrap:wrap}.adv-grid{grid-template-columns:1fr}.tab-bar{padding:0 16px}}
-"""
+""" + RADAR_CSS
 
 
 # ── JS ─────────────────────────────────────────────────────────────────────────
@@ -324,6 +361,7 @@ const REC_COLORS = {ADD:'#16a34a',HOLD:'#3b82f6',WATCH:'#d97706',TRIM:'#f97316',
 function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + name));
+  if (name === 'radar' && !radarInitialized) { radarInitialized = true; initRadar(); }
 }
 
 let evtSource    = null;
@@ -687,7 +725,7 @@ window.addEventListener('load', function() {
     }
   }).catch(()=>startRefresh());
 });
-"""
+""" + RADAR_JS
 
 
 # ── HTML template ──────────────────────────────────────────────────────────────
@@ -769,11 +807,7 @@ _HTML = (
 
     # ── Radar Screen tab ──────────────────────────────────────────────────────
     '<div class="tab-content" id="tab-radar">'
-    '<div class="coming-soon">'
-    '<div class="cs-icon">&#128225;</div>'
-    '<h2>Radar Screen</h2>'
-    '<p>Coming soon</p>'
-    '</div>'
+    + RADAR_HTML +
     '</div>'
 
     # ── News Terminal tab ─────────────────────────────────────────────────────
