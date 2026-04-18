@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stock_analysis import (
     score_stock, PORTFOLIOS,
     read_portfolio_sheet, enrich_with_portfolio, generate_advisor_recs,
-    generate_dashboard,
+    generate_dashboard, fetch_benchmark_returns,
 )
 
 app = Flask(__name__)
@@ -21,6 +21,7 @@ _lock            = threading.Lock()
 _results         = {}   # {portfolio_name: [enriched result dicts]}
 _advisor_recs    = []
 _portfolio_totals= {}
+_benchmarks      = {}
 _updated         = None
 _busy            = False
 
@@ -60,6 +61,7 @@ def api_data():
             "portfolios":       {n: [_j(r) for r in rs] for n, rs in _results.items()},
             "advisor_recs":     _advisor_recs,
             "portfolio_totals": _portfolio_totals,
+            "benchmarks":       _benchmarks,
             "updated":          _updated,
             "busy":             _busy,
         })
@@ -68,7 +70,7 @@ def api_data():
 @app.route("/api/refresh")
 def api_refresh():
     def stream():
-        global _results, _advisor_recs, _portfolio_totals, _updated, _busy
+        global _results, _advisor_recs, _portfolio_totals, _benchmarks, _updated, _busy
         with _lock:
             if _busy:
                 yield "data: " + json.dumps({"type": "busy"}) + "\n\n"
@@ -76,8 +78,10 @@ def api_refresh():
             _busy = True
         try:
             # Read live portfolio from Google Sheets (falls back to hardcoded)
-            sheet_portfolios, positions = read_portfolio_sheet()
+            sheet_portfolios, positions, cash, portfolio_pnl_pct = read_portfolio_sheet()
             active = sheet_portfolios if sheet_portfolios else PORTFOLIOS
+            if not sheet_portfolios:
+                cash, portfolio_pnl_pct = 0.0, None
 
             pairs = [(n, t) for n, ts in active.items() for t in ts]
             total = len(pairs)
@@ -103,18 +107,27 @@ def api_refresh():
             enriched_portfolios, totals = {}, {}
             all_enriched = []
             for pname, results in raw.items():
-                enriched, ptotals = enrich_with_portfolio(results, positions)
+                enriched, ptotals = enrich_with_portfolio(results, positions, cash, portfolio_pnl_pct)
                 enriched_portfolios[pname] = enriched
                 all_enriched.extend(enriched)
                 totals = ptotals  # single portfolio case
 
             advisor = generate_advisor_recs(all_enriched)
+
+            # Fetch benchmark returns (S&P 500 + NASDAQ)
+            bm = {}
+            try:
+                bm = fetch_benchmark_returns()
+            except Exception:
+                pass
+
             ts = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
 
             with _lock:
                 _results          = enriched_portfolios
                 _advisor_recs     = advisor
                 _portfolio_totals = totals
+                _benchmarks       = bm
                 _updated          = ts
 
             # Regenerate static dashboard.html
@@ -160,11 +173,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .rbtn:disabled{opacity:.4;cursor:not-allowed;transform:none}
 /* portfolio strip */
 .pstrip{display:flex;gap:0;border-bottom:1px solid #0f1a2e;background:#07101f;overflow-x:auto}
-.ps{flex:1;min-width:140px;padding:14px 24px;border-right:1px solid #0f1a2e;display:flex;flex-direction:column;gap:3px}
+.ps{flex:1;min-width:130px;padding:12px 22px;border-right:1px solid #0f1a2e;display:flex;flex-direction:column;gap:3px}
 .ps:last-child{border-right:none}
 .ps-lbl{font-size:.62rem;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#2d4a6e}
-.ps-val{font-size:1.15rem;font-weight:800;color:#e2e8f0}
+.ps-val{font-size:1.1rem;font-weight:800;color:#e2e8f0}
 .ps-val.up{color:#00e676}.ps-val.dn{color:#f44336}
+/* benchmark strip */
+.bench-strip{display:none;gap:0;border-bottom:1px solid #0f1a2e;background:#060e1c;overflow-x:auto;align-items:stretch}
+.bs{flex:1;min-width:120px;padding:10px 20px;border-right:1px solid #0f1a2e;display:flex;flex-direction:column;gap:2px}
+.bs:last-child{border-right:none}
+.bs-lbl{font-size:.58rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#1a2d45}
+.bs-val{font-size:.88rem;font-weight:800;color:#e2e8f0}
+.bs-val.up{color:#00e676}.bs-val.dn{color:#f44336}
+.bs-val.out{color:#00e676}.bs-val.under{color:#f44336}.bs-val.even{color:#ffd740}
+.bs-sep{width:1px;background:#1a2d45;margin:8px 0;flex-shrink:0}
+.bs-divider{width:1px;background:#162035;flex-shrink:0}
 /* main */
 .main{padding:28px 36px;max-width:1600px;margin:0 auto}
 /* advisor */
@@ -440,15 +463,31 @@ function bumpCard(signal) {
 
 // ── Portfolio summary strip ───────────────────────────────────────────────────
 function renderPortfolioStrip(totals) {
-  if (!totals || !totals.total_market_value) return;
-  const pnl    = totals.total_unrealized_pnl;
-  const pnlPct = totals.total_unrealized_pnl_pct;
-  const pnlCls = pnl >= 0 ? 'up' : 'dn';
-  const pnlSign= pnl >= 0 ? '+' : '';
+  if (!totals || !totals.total_portfolio_value) return;
+  const pnl      = totals.total_unrealized_pnl;
+  const pnlPct   = totals.total_unrealized_pnl_pct;
+  const pnlCls   = pnl >= 0 ? 'up' : 'dn';
+  const pnlSign  = pnl >= 0 ? '+' : '';
+  const cash     = totals.cash || 0;
+  const cashPct  = totals.cash_weight_pct || 0;
+  const eqMv     = totals.total_market_value || 0;
+  const eqPct    = totals.equity_weight_pct || 0;
+  const totalPv  = totals.total_portfolio_value;
 
   document.getElementById('ps-val').innerHTML =
-    '<div class="ps-lbl">Portfolio Value</div>'+
-    '<div class="ps-val">$'+totals.total_market_value.toLocaleString('en-US',{maximumFractionDigits:0})+'</div>';
+    '<div class="ps-lbl">Total Portfolio</div>'+
+    '<div class="ps-val">$'+totalPv.toLocaleString('en-US',{maximumFractionDigits:0})+'</div>';
+  document.getElementById('ps-eq').innerHTML =
+    '<div class="ps-lbl">Equity</div>'+
+    '<div class="ps-val">$'+eqMv.toLocaleString('en-US',{maximumFractionDigits:0})+
+    '<br><small style="font-size:.68rem;color:#3d5475;font-weight:600">'+eqPct.toFixed(1)+'% of portfolio</small></div>';
+  document.getElementById('ps-cash').innerHTML =
+    '<div class="ps-lbl">Cash</div>'+
+    '<div class="ps-val">'+(cash > 0
+      ? '$'+cash.toLocaleString('en-US',{maximumFractionDigits:0})+
+        '<br><small style="font-size:.68rem;color:#3d5475;font-weight:600">'+cashPct.toFixed(1)+'% of portfolio</small>'
+      : '<span style="color:#1a2d45">—</span>')+
+    '</div>';
   document.getElementById('ps-pnl').innerHTML =
     '<div class="ps-lbl">Unrealized P&amp;L</div>'+
     '<div class="ps-val '+pnlCls+'">'+pnlSign+'$'+Math.abs(pnl).toLocaleString('en-US',{maximumFractionDigits:0})+
@@ -456,6 +495,49 @@ function renderPortfolioStrip(totals) {
   document.getElementById('ps-pos').innerHTML =
     '<div class="ps-lbl">Open Positions</div>'+
     '<div class="ps-val">'+totals.num_positions+'</div>';
+}
+
+// ── Benchmark comparison strip ────────────────────────────────────────────────
+function renderBenchmarks(totals, benchmarks) {
+  const strip = document.getElementById('bench-strip');
+  if (!benchmarks || Object.keys(benchmarks).length === 0 || !totals) {
+    strip.style.display = 'none';
+    return;
+  }
+  // Prefer the sheet's portfolio P&L% (YTD); fall back to calculated unrealized P&L%
+  const portRet  = totals.sheet_pnl_pct != null ? totals.sheet_pnl_pct : totals.total_unrealized_pnl_pct;
+  if (portRet == null) { strip.style.display = 'none'; return; }
+  strip.style.display = 'flex';
+  const portCls  = portRet >= 0 ? 'up' : 'dn';
+  const portSign = portRet >= 0 ? '+' : '';
+  const lbl      = totals.sheet_pnl_pct != null ? 'My Portfolio (YTD)' : 'My Portfolio (P&amp;L)';
+
+  document.getElementById('bs-port').innerHTML =
+    '<div class="bs-lbl">'+lbl+'</div>'+
+    '<div class="bs-val '+portCls+'">'+portSign+portRet.toFixed(2)+'%</div>';
+
+  const pairs = [
+    {bmId:'bs-sp500', vsId:'bs-vs-sp500', key:'sp500'},
+    {bmId:'bs-nasdaq', vsId:'bs-vs-nasdaq', key:'nasdaq'},
+  ];
+  for (const {bmId, vsId, key} of pairs) {
+    const bm = benchmarks[key];
+    if (!bm) continue;
+    const bmRet  = bm.return_ytd;
+    const bmCls  = bmRet >= 0 ? 'up' : 'dn';
+    const bmSign = bmRet >= 0 ? '+' : '';
+    document.getElementById(bmId).innerHTML =
+      '<div class="bs-lbl">'+bm.name+' (YTD)</div>'+
+      '<div class="bs-val '+bmCls+'">'+bmSign+bmRet.toFixed(2)+'%</div>';
+    const diff     = portRet - bmRet;
+    const diffCls  = diff > 0.5 ? 'out' : diff < -0.5 ? 'under' : 'even';
+    const diffLbl  = diff > 0.5 ? 'OUTPERFORMING' : diff < -0.5 ? 'UNDERPERFORMING' : 'IN LINE';
+    const diffSign = diff >= 0 ? '+' : '';
+    document.getElementById(vsId).innerHTML =
+      '<div class="bs-lbl">vs '+bm.name+'</div>'+
+      '<div class="bs-val '+diffCls+'">'+diffLbl+
+      '<br><small style="font-size:.72rem;font-weight:600">'+diffSign+diff.toFixed(2)+'%</small></div>';
+  }
 }
 
 // ── Portfolio Advisor ─────────────────────────────────────────────────────────
@@ -494,9 +576,11 @@ function renderAll(data) {
   const portfolios = data.portfolios || {};
   const totals     = data.portfolio_totals || {};
   const advisor    = data.advisor_recs || [];
+  const benchmarks = data.benchmarks   || {};
   const updated    = data.updated;
 
   renderPortfolioStrip(totals);
+  renderBenchmarks(totals, benchmarks);
   renderAdvisor(advisor);
 
   const counts = {'STRONG BUY':0,'BUY':0,'NEUTRAL':0,'SELL':0,'STRONG SELL':0};
@@ -614,9 +698,22 @@ _HTML = (
 
     # portfolio strip
     '<div class="pstrip">'
-    '<div class="ps" id="ps-val"><div class="ps-lbl">Portfolio Value</div><div class="ps-val">—</div></div>'
+    '<div class="ps" id="ps-val"><div class="ps-lbl">Total Portfolio</div><div class="ps-val">—</div></div>'
+    '<div class="ps" id="ps-eq"><div class="ps-lbl">Equity</div><div class="ps-val">—</div></div>'
+    '<div class="ps" id="ps-cash"><div class="ps-lbl">Cash</div><div class="ps-val">—</div></div>'
     '<div class="ps" id="ps-pnl"><div class="ps-lbl">Unrealized P&amp;L</div><div class="ps-val">—</div></div>'
     '<div class="ps" id="ps-pos"><div class="ps-lbl">Open Positions</div><div class="ps-val">—</div></div>'
+    '</div>'
+
+    # benchmark strip
+    '<div class="bench-strip" id="bench-strip">'
+    '<div class="bs" id="bs-port"><div class="bs-lbl">My Portfolio (P&amp;L)</div><div class="bs-val">—</div></div>'
+    '<div class="bs-divider"></div>'
+    '<div class="bs" id="bs-sp500"><div class="bs-lbl">S&amp;P 500 (YTD)</div><div class="bs-val">—</div></div>'
+    '<div class="bs" id="bs-nasdaq"><div class="bs-lbl">NASDAQ (YTD)</div><div class="bs-val">—</div></div>'
+    '<div class="bs-divider"></div>'
+    '<div class="bs" id="bs-vs-sp500"><div class="bs-lbl">vs S&amp;P 500</div><div class="bs-val">—</div></div>'
+    '<div class="bs" id="bs-vs-nasdaq"><div class="bs-lbl">vs NASDAQ</div><div class="bs-val">—</div></div>'
     '</div>'
 
     # main

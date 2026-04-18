@@ -560,20 +560,22 @@ CREDENTIALS_FILE  = "google_credentials.json"
 
 def read_portfolio_sheet():
     """Read live positions from Google Sheets.
-    Returns (portfolios_dict, positions_dict) or ({}, {}) on failure.
-      portfolios_dict : {"My Portfolio": ["CRWV", "GOOGL", ...]}
-      positions_dict  : {"CRWV": {"shares": 200.0, "cost_basis": 115.51}, ...}
+    Returns (portfolios_dict, positions_dict, cash, portfolio_pnl_pct) or ({}, {}, 0.0, None).
+      portfolios_dict  : {"My Portfolio": ["CRWV", "GOOGL", ...]}
+      positions_dict   : {"CRWV": {"shares": 200.0, "cost_basis": 115.51, "pnl_pct": 1.24}, ...}
+      cash             : float — cash balance read directly from sheet
+      portfolio_pnl_pct: float | None — overall portfolio YTD P&L % from sheet
     """
     import warnings as _w; _w.filterwarnings("ignore")
     try:
         import gspread
         from google.oauth2.service_account import Credentials as _C
     except ImportError:
-        return {}, {}
+        return {}, {}, 0.0, None
 
     creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CREDENTIALS_FILE)
     if not os.path.exists(creds_path):
-        return {}, {}
+        return {}, {}, 0.0, None
 
     try:
         creds = _C.from_service_account_file(
@@ -586,10 +588,10 @@ def read_portfolio_sheet():
         rows = gspread.authorize(creds).open(GOOGLE_SHEET_NAME).sheet1.get_all_values()
     except Exception as e:
         print(f"  ⚠  Google Sheets: {e}")
-        return {}, {}
+        return {}, {}, 0.0, None
 
     # Locate header row (contains "Instrument" or "Ticker")
-    header_idx = ticker_col = shares_col = cost_col = None
+    header_idx = ticker_col = shares_col = cost_col = mv_col = pnl_pct_col = None
     for i, row in enumerate(rows):
         low = [c.strip().lower() for c in row]
         if any(k in low for k in ["instrument", "ticker", "symbol"]):
@@ -603,10 +605,15 @@ def read_portfolio_sheet():
                     cost_col = j
                 elif cost_col is None and "avg" in h and "cost" in h:
                     cost_col = j
+                if ("market" in h and "value" in h) or ("mkt" in h and "val" in h):
+                    mv_col = j
+                # "Unrlzd P&L %" — the % column (not the raw $ one)
+                if "unrlzd" in h and "%" in h:
+                    pnl_pct_col = j
             break
 
     if header_idx is None or ticker_col is None:
-        return {}, {}
+        return {}, {}, 0.0, None
 
     def _n(s):
         try:
@@ -614,25 +621,51 @@ def read_portfolio_sheet():
         except Exception:
             return 0.0
 
+    cash = 0.0
+    portfolio_pnl_pct = None
     tickers, positions = [], {}
     for row in rows[header_idx + 1:]:
         if not row or len(row) <= ticker_col:
             continue
-        ticker = str(row[ticker_col]).strip().upper()
-        if not ticker or len(ticker) > 6:
+        cell = str(row[ticker_col]).strip()
+        ticker = cell.upper()
+        if not ticker:
+            continue
+        # Detect the portfolio-level P&L % summary row (e.g. "Portfolio P&L (%) YTD")
+        cell_low = cell.lower()
+        if "portfolio" in cell_low and ("p&l" in cell_low or "pnl" in cell_low):
+            if mv_col and len(row) > mv_col:
+                v = _n(row[mv_col])
+                if v:
+                    portfolio_pnl_pct = v
+            continue
+        # Detect cash rows
+        if "CASH" in ticker or ticker in ("USD", "USDT", "MONEY", "LIQUIDITY"):
+            if mv_col and len(row) > mv_col and _n(row[mv_col]):
+                cash = _n(row[mv_col])
+            elif shares_col and len(row) > shares_col:
+                sh = _n(row[shares_col])
+                co = _n(row[cost_col]) if cost_col and len(row) > cost_col else 1.0
+                cash = sh * co if co and abs(co - 1.0) > 0.01 else sh
+            continue
+        if len(ticker) > 6:
             continue
         if not ticker.replace(".", "").replace("-", "").isalpha():
             continue
-        shares   = _n(row[shares_col]) if shares_col and len(row) > shares_col else 0.0
-        cost     = _n(row[cost_col])   if cost_col   and len(row) > cost_col   else 0.0
+        shares  = _n(row[shares_col])   if shares_col   and len(row) > shares_col   else 0.0
+        cost    = _n(row[cost_col])     if cost_col     and len(row) > cost_col     else 0.0
+        pnl_pct = _n(row[pnl_pct_col]) if pnl_pct_col  and len(row) > pnl_pct_col  else None
         tickers.append(ticker)
-        positions[ticker] = {"shares": shares, "cost_basis": cost}
+        positions[ticker] = {"shares": shares, "cost_basis": cost, "pnl_pct": pnl_pct}
 
-    return ({"My Portfolio": tickers}, positions) if tickers else ({}, {})
+    return ({"My Portfolio": tickers}, positions, cash, portfolio_pnl_pct) if tickers else ({}, {}, 0.0, None)
 
 
-def enrich_with_portfolio(results_list: list, positions: dict) -> tuple:
+def enrich_with_portfolio(results_list: list, positions: dict, cash: float = 0.0,
+                          portfolio_pnl_pct: float = None) -> tuple:
     """Add market value, cost basis, P&L, and weight_pct to each result dict.
+    Per-stock P&L % is taken directly from the sheet when available.
+    Weights are calculated as % of total portfolio (equity + cash).
     Returns (enriched_list, totals_dict).
     """
     enriched, total_mv = [], 0.0
@@ -644,7 +677,11 @@ def enrich_with_portfolio(results_list: list, positions: dict) -> tuple:
         mv         = shares * price
         total_cost = shares * cost_ps
         pnl        = mv - total_cost
-        pnl_pct    = (pnl / total_cost * 100) if total_cost else 0.0
+        # Prefer the sheet's P&L% if available; fall back to calculated
+        sheet_pnl_pct = pos.get("pnl_pct")
+        pnl_pct = float(sheet_pnl_pct) if sheet_pnl_pct is not None else (
+            (pnl / total_cost * 100) if total_cost else 0.0
+        )
         total_mv  += mv
         enriched.append({**r,
             "shares": shares, "cost_basis_ps": cost_ps,
@@ -652,19 +689,48 @@ def enrich_with_portfolio(results_list: list, positions: dict) -> tuple:
             "unrealized_pnl": pnl, "unrealized_pnl_pct": pnl_pct,
             "weight_pct": 0.0})
 
+    total_portfolio = total_mv + cash
     for r in enriched:
-        r["weight_pct"] = (r["market_value"] / total_mv * 100) if total_mv else 0.0
+        r["weight_pct"] = (r["market_value"] / total_portfolio * 100) if total_portfolio else 0.0
 
     all_cost = sum(r["total_cost"] for r in enriched)
     tot_pnl  = total_mv - all_cost
+    cash_weight   = (cash / total_portfolio * 100) if total_portfolio else 0.0
+    equity_weight = 100.0 - cash_weight if total_portfolio else 0.0
     totals = {
-        "total_market_value":     round(total_mv, 2),
-        "total_cost":             round(all_cost, 2),
-        "total_unrealized_pnl":   round(tot_pnl,  2),
+        "total_market_value":       round(total_mv, 2),
+        "total_portfolio_value":    round(total_portfolio, 2),
+        "total_cost":               round(all_cost, 2),
+        "total_unrealized_pnl":     round(tot_pnl, 2),
         "total_unrealized_pnl_pct": round((tot_pnl / all_cost * 100) if all_cost else 0, 2),
-        "num_positions":          len(enriched),
+        "num_positions":            len(enriched),
+        "cash":                     round(cash, 2),
+        "cash_weight_pct":          round(cash_weight, 2),
+        "equity_weight_pct":        round(equity_weight, 2),
+        "sheet_pnl_pct":            round(portfolio_pnl_pct, 2) if portfolio_pnl_pct is not None else None,
     }
     return enriched, totals
+
+
+def fetch_benchmark_returns() -> dict:
+    """Fetch YTD returns for S&P 500 and NASDAQ Composite."""
+    symbols = {"sp500": ("S&P 500", "^GSPC"), "nasdaq": ("NASDAQ", "^IXIC")}
+    result = {}
+    year_start = f"{datetime.now().year}-01-01"
+    for key, (name, sym) in symbols.items():
+        try:
+            df = yf.download(sym, start=year_start, interval="1d", progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            first = float(df["Close"].iloc[0])
+            last  = float(df["Close"].iloc[-1])
+            ret   = (last - first) / first * 100
+            result[key] = {"name": name, "symbol": sym, "return_ytd": round(ret, 2), "price": round(last, 2)}
+        except Exception:
+            pass
+    return result
 
 
 def generate_advisor_recs(enriched: list) -> list:
@@ -672,7 +738,9 @@ def generate_advisor_recs(enriched: list) -> list:
     if not enriched:
         return []
 
-    avg_w = 100.0 / len(enriched)
+    # Use actual average equity weight (accounts for cash allocation)
+    equity_total_w = sum(r.get("weight_pct", 0) for r in enriched)
+    avg_w = equity_total_w / len(enriched) if enriched else (100.0 / len(enriched))
 
     def _hl(r):
         d, h = r.get("details", {}), []
@@ -753,7 +821,7 @@ def generate_advisor_recs(enriched: list) -> list:
 if __name__ == "__main__":
 
     # Try Google Sheets first; fall back to hardcoded PORTFOLIOS
-    _sheet_portfolios, _positions = read_portfolio_sheet()
+    _sheet_portfolios, _positions, _cash, _pnl_pct = read_portfolio_sheet()
     _active_portfolios = _sheet_portfolios if _sheet_portfolios else PORTFOLIOS
 
     all_dfs            = []
