@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Radar Screen — server-side data fetching for watchlist stocks."""
 
-import json, os, time, threading
+import json, os, ssl, time, threading
 from datetime import datetime, date
 import urllib.request
 import xml.etree.ElementTree as ET
+
+_SSL_CTX = ssl._create_unverified_context()
 
 import yfinance as yf
 
@@ -48,7 +50,7 @@ def _news_sentiment(ticker):
         url = (f"https://feeds.finance.yahoo.com/rss/2.0/headline"
                f"?s={ticker}&region=US&lang=en-US")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as r:
             root = ET.fromstring(r.read())
         titles = [item.findtext("title", "") for item in root.iter("item")][:5]
         if not titles:
@@ -205,7 +207,10 @@ def fetch_radar_stock(ticker):
         ins = t.insider_transactions
         if ins is not None and not ins.empty:
             row   = ins.iloc[0]
-            itype = str(row.get("Transaction", row.get("transaction", ""))).strip()
+            # Transaction column is often empty; Text field is more reliable
+            itext = str(row.get("Text", row.get("text", ""))).lower()
+            itype = str(row.get("Transaction", row.get("transaction", ""))).lower()
+            combined = itext + " " + itype
             ival  = row.get("Value", row.get("value", None))
             idate = row.get("Start Date", row.get("startDate", None))
             if idate is not None:
@@ -215,13 +220,12 @@ def fetch_radar_stock(ticker):
                     insider_days_ago = max(0, (date.today() - idate).days)
                 except Exception:
                     pass
-            il = itype.lower()
-            if any(x in il for x in ("buy", "purchase", "acqui")):
+            if any(x in combined for x in ("purchase", "acqui", "bought")):
                 insider_type = "Buy"
-            elif any(x in il for x in ("sell", "sale", "dispos")):
+            elif any(x in combined for x in ("sale", "sell", "sold", "dispos")):
                 insider_type = "Sell"
             else:
-                insider_type = itype or "N/A"
+                insider_type = "N/A"
             if ival is not None and ival == ival:  # not NaN
                 try:
                     insider_val = int(float(ival))
@@ -248,36 +252,53 @@ def fetch_radar_stock(ticker):
     # ── Technical
     tech = _technical(ticker)
 
-    # ── Composite score 0–10
-    tech_s  = (tech["score"] + 10) / 20 * 10
+    # ── Hybrid Score system (0–10 each) ──────────────────────────────────────
+    def _sig(s):
+        if s <= 3.5:  return "Sell"
+        if s <= 6.4:  return "Neutral"
+        return "Buy"
 
-    eps_g_raw = eps_growth if isinstance(eps_growth, (int, float)) else None
+    # TECH SCORE (50% weight) — existing 10-indicator logic, normalised to 0-10
+    score_tech = round((tech["score"] + 10) / 20 * 10, 2)
+
+    # FUNDAMENTAL SCORE (30% weight)
+    # Components: analyst upside (30%), fwd P/E vs ~22 mkt avg (25%),
+    #             revenue growth (25%), profit margin (20%)
+    fpe_raw   = fpe        if isinstance(fpe,        (int, float)) else None
     rev_g_raw = rev_growth if isinstance(rev_growth, (int, float)) else None
     mar_raw   = margin     if isinstance(margin,     (int, float)) else None
-    fund_s    = _norm(eps_g_raw, -0.5, 1.0) * 0.5 + _norm(mar_raw, 0, 0.4) * 0.5
+    score_fund = round(max(0.0, min(10.0, (
+        _norm(upside,    -20,  50)             * 0.30 +
+        _norm(fpe_raw,     8,  40, invert=True) * 0.25 +   # lower fwd P/E = better
+        _norm(rev_g_raw, -0.2,  0.5)           * 0.25 +
+        _norm(mar_raw,    0,    0.4)            * 0.20
+    ))), 2)
 
-    fpe_raw   = fpe    if isinstance(fpe,    (int, float)) else None
-    val_s     = _norm(upside, -20, 50) * 0.6 + _norm(fpe_raw, 50, 5, invert=True) * 0.4
+    # RISK SCORE (20% weight) — higher score = LOWER risk
+    # Components: earnings proximity (40%), beta (35%), short interest (25%)
+    earn_days_num = earn_days if isinstance(earn_days, int) else None
+    if earn_days_num is None:       earn_risk = 6.0
+    elif earn_days_num < 7:         earn_risk = 2.0
+    elif earn_days_num < 14:        earn_risk = 4.0
+    elif earn_days_num < 30:        earn_risk = 6.5
+    else:                           earn_risk = 9.0
 
-    sent_map  = {"Positive": 8.0, "Neutral": 5.0, "Negative": 2.0, "N/A": 5.0}
-    sent_s    = sent_map.get(sentiment, 5.0)
+    beta_raw  = beta      if isinstance(beta,      (int, float)) else None
+    short_raw = short_int if isinstance(short_int, (int, float)) else None
+    score_risk = round(max(0.0, min(10.0, (
+        earn_risk                             * 0.40 +
+        _norm(beta_raw,  0, 2.5, invert=True) * 0.35 +   # lower beta = lower risk
+        _norm(short_raw, 0, 0.30, invert=True) * 0.25    # lower short % = lower risk
+    ))), 2)
 
-    ins_s     = 8.0 if insider_type == "Buy" else (3.0 if insider_type == "Sell" else 5.0)
-    inst_s    = _norm(inst_qoq, -5.0, 5.0) if isinstance(inst_qoq, float) else 5.0
-    inside_s  = ins_s * 0.6 + inst_s * 0.4
-
-    beta_raw  = beta if isinstance(beta, (int, float)) else None
-    risk_s    = _norm(beta_raw, 2.5, 0.3, invert=True)   # lower beta → less risk → higher score
-
-    composite = (
-        tech_s   * 0.25 +
-        fund_s   * 0.20 +
-        val_s    * 0.20 +
-        sent_s   * 0.15 +
-        inside_s * 0.10 +
-        risk_s   * 0.10
+    # HYBRID TOTAL
+    score_hybrid = round(
+        score_tech * 0.50 +
+        score_fund * 0.30 +
+        score_risk * 0.20,
+        2
     )
-    composite = round(max(0.0, min(10.0, composite)), 2)
+    composite = score_hybrid   # keep composite alias for summary cards
 
     upside_str = f"{upside:+.1f}%" if upside is not None else "N/A"
     rs_str     = f"{rs_30d:+.1f}%" if rs_30d  is not None else "N/A"
@@ -291,8 +312,13 @@ def fetch_radar_stock(ticker):
         "name":         name,
         "price":        _f(price, 2),
         "composite":    composite,
+        # hybrid scores
+        "score_tech":   score_tech,   "sig_tech":   _sig(score_tech),
+        "score_fund":   score_fund,   "sig_fund":   _sig(score_fund),
+        "score_risk":   score_risk,   "sig_risk":   _sig(score_risk),
+        "score_hybrid": score_hybrid, "sig_hybrid": _sig(score_hybrid),
         "updated":      datetime.now().strftime("%H:%M:%S"),
-        # technical
+        # technical detail
         "signal":       tech["signal"],
         "tech_score":   tech["score"],
         "rsi":          tech["rsi"],

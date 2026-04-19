@@ -78,6 +78,23 @@ table.radar-tbl tr.rdrow td{padding:0;border:none}
 .headlines ul{list-style:none;margin:0;padding:0}
 .headlines li{font-size:.78rem;color:#475569;padding:3px 0;border-bottom:1px solid #f5f5f5}
 .headlines li:last-child{border-bottom:none}
+/* inline ticker editing */
+.r-ticker-editable{cursor:text;border-bottom:1px dashed #cbd5e1;display:inline}
+.r-ticker-editable:hover{border-bottom-color:#3b82f6;color:#2563eb}
+.ticker-edit-input{width:72px;font-size:.92rem;font-weight:800;padding:2px 6px;border:2px solid #3b82f6;border-radius:6px;outline:none;color:#1a1a1a;background:#fff;font-family:inherit}
+/* column header tooltips */
+.th-wrap{position:relative;display:inline-flex;align-items:center;gap:4px}
+.th-wrap .th-tip{display:none;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:240px;background:#1e293b;color:#f1f5f9;font-size:.72rem;font-weight:400;line-height:1.45;padding:8px 11px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.18);z-index:200;pointer-events:none;white-space:normal;letter-spacing:0}
+.th-wrap:hover .th-tip{display:block}
+.th-tip-icon{font-size:.6rem;color:#cbd5e1;flex-shrink:0;margin-bottom:1px}
+/* hybrid score cells */
+.score-cell{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:44px}
+.score-num{font-size:.9rem;font-weight:800}
+.score-num.hi{color:#16a34a}.score-num.md{color:#d97706}.score-num.lo{color:#dc2626}
+.score-mini{font-size:.58rem;font-weight:700;padding:1px 5px;border-radius:8px;letter-spacing:.3px;white-space:nowrap}
+.score-mini.Buy{background:rgba(22,163,74,.12);color:#16a34a}
+.score-mini.Neutral{background:rgba(217,119,6,.1);color:#d97706}
+.score-mini.Sell{background:rgba(220,38,38,.1);color:#dc2626}
 /* loading spinner */
 .radar-spinner{display:none;text-align:center;padding:40px 20px;color:#94a3b8}
 .radar-spinner.show{display:block}
@@ -144,25 +161,38 @@ RADAR_HTML = (
 RADAR_JS = r"""
 // ── Radar Screen ──────────────────────────────────────────────────────────────
 let radarData      = [];
-let radarSort      = {col: 'composite', dir: -1};
+let radarSort      = {col: 'score_hybrid', dir: -1};
 let radarInitialized = false;
 const RADAR_COLS = [
-  {k:'ticker',    h:'Ticker',     s:false},
-  {k:'price',     h:'Price',      s:true},
-  {k:'composite', h:'Score',      s:true},
-  {k:'signal',    h:'Signal',     s:false},
-  {k:'rsi',       h:'RSI',        s:true},
-  {k:'macd',      h:'MACD',       s:false},
-  {k:'pe',        h:'P/E',        s:true},
-  {k:'fpe',       h:'Fwd P/E',    s:true},
-  {k:'upside',    h:'Upside',     s:true, raw:'upside_raw'},
-  {k:'earn_date', h:'Earnings',   s:true, raw:'earn_days'},
-  {k:'beta',      h:'Beta',       s:true},
-  {k:'rs_30d',    h:'RS 30d',     s:true, raw:'rs_30d_raw'},
-  {k:'sentiment', h:'Sentiment',  s:false},
+  {k:'ticker',       h:'Ticker',  s:false},
+  {k:'price',        h:'Price',   s:true},
+  {k:'score_tech',   h:'TECH',    s:true,
+    tip:'Technical Score (0-10): Based on 10 price indicators \u2014 RSI, MACD, Moving Averages, Bollinger Bands, Volume, Stochastic, ADX, EMA, OBV, ATR. Score above 6.5\u00a0=\u00a0Buy signal.'},
+  {k:'score_fund',   h:'FUND',    s:true,
+    tip:'Fundamental Score (0-10): Based on analyst price target upside, Forward P/E vs sector, revenue growth, and profit margin. Score above 6.5\u00a0=\u00a0fundamentally attractive.'},
+  {k:'score_risk',   h:'RISK',    s:true,
+    tip:'Risk Score (0-10): Based on earnings proximity, beta volatility, and short interest. Higher score\u00a0=\u00a0lower risk. Score below 3.5\u00a0=\u00a0high risk warning.'},
+  {k:'score_hybrid', h:'HYBRID',  s:true,
+    tip:'Hybrid Score (0-10): Weighted total \u2014 50% Technical + 30% Fundamental + 20% Risk. This is the primary signal. Above 6.5\u00a0=\u00a0Buy, Below 3.5\u00a0=\u00a0Sell.'},
+  {k:'rsi',          h:'RSI',     s:true,
+    tip:'Relative Strength Index: Measures momentum. Above 70\u00a0=\u00a0overbought (potential sell). Below 30\u00a0=\u00a0oversold (potential buy).'},
+  {k:'macd',         h:'MACD',    s:false,
+    tip:'Moving Average Convergence Divergence: Shows trend direction. Bullish\u00a0=\u00a0upward momentum. Bearish\u00a0=\u00a0downward momentum.'},
+  {k:'pe',           h:'P/E',     s:true,
+    tip:'Price-to-Earnings Ratio (Trailing): How much you pay per $1 of current earnings. Lower\u00a0=\u00a0cheaper relative to earnings.'},
+  {k:'fpe',          h:'Fwd P/E', s:true,
+    tip:'Forward P/E: Same as P/E but uses next year\u2019s estimated earnings. More forward-looking than trailing P/E.'},
+  {k:'upside',       h:'Upside',  s:true, raw:'upside_raw',
+    tip:'Analyst Price Target Upside: The % gap between current price and the average analyst 12-month price target. Positive\u00a0=\u00a0stock is below target.'},
+  {k:'earn_date',    h:'Earnings',s:true, raw:'earn_days',
+    tip:'Next Earnings Date: When the company reports quarterly results. Dates in red\u00a0=\u00a0within 14 days (high volatility risk).'},
+  {k:'beta',         h:'Beta',    s:true,
+    tip:'Beta vs S&P 500: Measures volatility relative to the market. 1.0\u00a0=\u00a0moves with market. Above 1.5\u00a0=\u00a0high volatility. Below 0.8\u00a0=\u00a0more defensive.'},
+  {k:'rs_30d',       h:'RS 30d',  s:true, raw:'rs_30d_raw'},
+  {k:'sentiment',    h:'Sentiment',s:false},
   {k:'insider_type', h:'Insider', s:false},
-  {k:'inst_own',  h:'Inst Own',   s:false},
-  {k:'_rm',       h:'',           s:false},
+  {k:'inst_own',     h:'Inst Own',s:false},
+  {k:'_rm',          h:'',        s:false},
 ];
 
 function radarSortedData() {
@@ -208,6 +238,13 @@ function rowBgCls(v) {
   return 'bg-red';
 }
 
+function scoreCellHtml(score, sig) {
+  if (score == null) return '<span style="color:#94a3b8">N/A</span>';
+  const numCls = score >= 6.5 ? 'hi' : score >= 3.6 ? 'md' : 'lo';
+  return '<div class="score-cell"><span class="score-num '+numCls+'">'+score+'</span>'+
+         '<span class="score-mini '+sig+'">'+sig+'</span></div>';
+}
+
 function signalBadge(sig) {
   if (!sig || sig === 'N/A') return '<span style="color:#94a3b8">N/A</span>';
   const map = {
@@ -241,11 +278,85 @@ function renderRadarHeader() {
   const tr = document.getElementById('radar-thead');
   if (!tr) return;
   tr.innerHTML = RADAR_COLS.map(c => {
-    if (!c.s) return '<th'+(c.k==='_rm'?' style="width:36px"':'')+'>'+(c.h)+'</th>';
+    const tipHtml = c.tip
+      ? '<span class="th-tip">'+c.tip+'</span>'
+      : '';
+    const inner = c.tip
+      ? '<span class="th-wrap">'+c.h+'<span class="th-tip-icon">&#9432;</span>'+tipHtml+'</span>'
+      : c.h;
+    if (!c.s) return '<th'+(c.k==='_rm'?' style="width:36px"':'')+'>'+inner+'</th>';
     const active = c.k === radarSort.col;
     const dirCls = active ? (radarSort.dir < 0 ? ' desc' : ' asc') : '';
-    return '<th class="s'+dirCls+'" onclick="radarSortBy(\''+c.k+'\')">'+c.h+'</th>';
+    return '<th class="s'+dirCls+'" onclick="radarSortBy(\''+c.k+'\')">'+inner+'</th>';
   }).join('');
+}
+
+function startTickerEdit(ticker) {
+  const row = document.getElementById('rr-' + ticker);
+  if (!row) return;
+  const cell = row.cells[0];
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = ticker;
+  input.className = 'ticker-edit-input';
+  let handled = false;
+  input.onkeydown = function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      handled = true;
+      const newTicker = input.value.trim().toUpperCase();
+      if (newTicker && newTicker !== ticker) {
+        confirmTickerEdit(ticker, newTicker);
+      } else {
+        renderRadarTable();
+      }
+    } else if (e.key === 'Escape') {
+      handled = true;
+      renderRadarTable();
+    }
+  };
+  input.onblur = function() {
+    if (!handled) renderRadarTable();   // user clicked away — cancel
+  };
+  cell.innerHTML = '';
+  cell.appendChild(input);
+  input.select();
+  input.focus();
+}
+
+function confirmTickerEdit(oldTicker, newTicker) {
+  const idx = radarData.findIndex(r => r.ticker === oldTicker);
+  if (idx === -1) { renderRadarTable(); return; }
+  // Swap in a loading placeholder immediately so the table re-renders
+  radarData[idx] = {
+    ticker: newTicker, composite: 0,
+    score_tech: null, score_fund: null, score_risk: null, score_hybrid: null,
+    sig_tech: 'Neutral', sig_fund: 'Neutral', sig_risk: 'Neutral', sig_hybrid: 'Neutral',
+    price: '…', rsi: '…', macd: '…', pe: '…', fpe: '…', upside: '…',
+    earn_date: '…', earn_days: null, beta: '…', rs_30d: '…',
+    sentiment: '…', insider_type: '…', insider_val: '…', insider_days: '…', inst_own: '…',
+  };
+  renderRadarTable();
+  // Update watchlist and fetch fresh data
+  fetch('/api/radar/watchlist', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'remove', ticker: oldTicker}),
+  })
+  .then(() => fetch('/api/radar/watchlist', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'add', ticker: newTicker}),
+  }))
+  .then(() => fetch('/api/radar/stock/' + newTicker + '?force=1'))
+  .then(r => r.json())
+  .then(data => {
+    const i = radarData.findIndex(r => r.ticker === newTicker);
+    if (i >= 0) radarData[i] = data;
+    renderRadarTable();
+  })
+  .catch(err => {
+    console.error('confirmTickerEdit error', err);
+    renderRadarTable();
+  });
 }
 
 function renderRadarTable() {
@@ -267,10 +378,15 @@ function renderRadarTable() {
     tr.id = 'rr-' + r.ticker;
     tr.onclick = () => toggleRadarDetail(r.ticker);
     tr.innerHTML =
-      '<td><div class="r-ticker">'+r.ticker+'</div>'+(r.name&&r.name!==r.ticker?'<div class="r-name">'+r.name+'</div>':'')+'</td>'+
+      '<td onclick="startTickerEdit(\''+r.ticker+'\');event.stopPropagation()" title="Click to edit ticker">'+
+        '<div class="r-ticker r-ticker-editable">'+r.ticker+'</div>'+
+        (r.name&&r.name!==r.ticker?'<div class="r-name">'+r.name+'</div>':'')+
+      '</td>'+
       '<td class="r-price">'+(r.price!=='N/A'?'$'+r.price:r.price)+'</td>'+
-      '<td><span class="cs-pill '+csCls+'">'+(r.composite||'—')+'</span></td>'+
-      '<td>'+signalBadge(r.signal)+'</td>'+
+      '<td>'+scoreCellHtml(r.score_tech,   r.sig_tech)+'</td>'+
+      '<td>'+scoreCellHtml(r.score_fund,   r.sig_fund)+'</td>'+
+      '<td>'+scoreCellHtml(r.score_risk,   r.sig_risk)+'</td>'+
+      '<td>'+scoreCellHtml(r.score_hybrid, r.sig_hybrid)+'</td>'+
       '<td><span class="rsi-val '+rsiCls(r.rsi)+'">'+r.rsi+'</span></td>'+
       '<td>'+r.macd+'</td>'+
       '<td>'+r.pe+'</td>'+
@@ -344,11 +460,11 @@ function toggleRadarDetail(ticker) {
 
 function renderRadarCards(sorted) {
   // Best opportunity
-  const best = sorted.reduce((b, r) => (!b || r.composite > b.composite) ? r : b, null);
+  const best = sorted.reduce((b, r) => (!b || (r.score_hybrid||0) > (b.score_hybrid||0)) ? r : b, null);
   if (best) {
     const el = document.getElementById('rc-best');
     el.querySelector('.rc-ticker').textContent = best.ticker;
-    el.querySelector('.rc-val').textContent = 'Composite: ' + best.composite;
+    el.querySelector('.rc-val').textContent = 'Hybrid: ' + best.score_hybrid + ' · ' + best.sig_hybrid;
     el.querySelector('.rc-val').className = 'rc-val up';
   }
   // Most overbought

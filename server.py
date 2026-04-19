@@ -6,7 +6,8 @@ streams real-time updates, and generates Portfolio Advisor recommendations.
 """
 import json, os, sys, threading
 from datetime import datetime
-from flask import Flask, Response, jsonify, request
+from functools import wraps
+from flask import Flask, Response, jsonify, request, session, redirect, url_for
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stock_analysis import (
@@ -18,6 +19,42 @@ from radar import get_all_radar, get_radar_stock, load_watchlist, save_watchlist
 from radar_ui import RADAR_CSS, RADAR_JS, RADAR_HTML
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-local-key-change-in-prod")
+
+# ── Access control ─────────────────────────────────────────────────────────────
+# Passwords → access levels.
+# Set PASSWORD_FULL / PASSWORD_RADAR / PASSWORD_TALI as environment variables.
+# No fallback values — server will reject all logins if env vars are not set.
+_PASSWORDS = {k: v for k, v in {
+    os.environ.get("PASSWORD_FULL"):  "full",
+    os.environ.get("PASSWORD_RADAR"): "radar_only",
+    os.environ.get("PASSWORD_TALI"):  "tali",
+}.items() if k is not None}
+
+def _access():
+    return session.get("access")
+
+def _require(*levels):
+    """Decorator — redirect to login if session access level not in levels."""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if _access() not in levels:
+                return redirect(url_for("login"))
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+def _api_require(*levels):
+    """Decorator — return 403 JSON if session access level not in levels."""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if _access() not in levels:
+                return jsonify({"error": "unauthorized"}), 403
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
 
 _lock            = threading.Lock()
 _results         = {}   # {portfolio_name: [enriched result dicts]}
@@ -51,12 +88,37 @@ def _j(r):
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        pwd   = request.form.get("password", "")
+        level = _PASSWORDS.get(pwd)
+        if level:
+            session["access"] = level
+            return redirect(url_for("index"))
+        return _login_html(error="Incorrect access code")
+    return _login_html()
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@_require("full", "radar_only", "tali")
 def index():
+    level = _access()
+    if level == "tali":
+        return _TALI_HTML
+    if level == "radar_only":
+        return _HTML_RADAR_ONLY
     return _HTML
 
 
 @app.route("/api/data")
+@_api_require("full")
 def api_data():
     with _lock:
         return jsonify({
@@ -70,6 +132,7 @@ def api_data():
 
 
 @app.route("/api/refresh")
+@_api_require("full")
 def api_refresh():
     def stream():
         global _results, _advisor_recs, _portfolio_totals, _benchmarks, _updated, _busy
@@ -158,6 +221,7 @@ def api_refresh():
 # ── Radar routes ───────────────────────────────────────────────────────────────
 
 @app.route("/api/radar/data")
+@_api_require("full", "radar_only")
 def api_radar_data():
     force   = request.args.get("force") == "1"
     tickers = load_watchlist()
@@ -166,6 +230,7 @@ def api_radar_data():
 
 
 @app.route("/api/radar/watchlist", methods=["GET", "POST"])
+@_api_require("full", "radar_only")
 def api_radar_watchlist():
     if request.method == "GET":
         return jsonify({"tickers": load_watchlist()})
@@ -184,6 +249,7 @@ def api_radar_watchlist():
 
 
 @app.route("/api/radar/stock/<ticker>")
+@_api_require("full", "radar_only")
 def api_radar_stock(ticker):
     force = request.args.get("force") == "1"
     data  = get_radar_stock(ticker.upper(), force=force)
@@ -827,6 +893,81 @@ _HTML = (
 )
 
 
+# ── Radar-only variant: hide Portfolio tab via injected CSS + auto-switch ──────
+_HTML_RADAR_ONLY = _HTML.replace(
+    "</body>",
+    "<style>"
+    ".tab-btn[data-tab='portfolio']{display:none!important}"
+    "#tab-portfolio{display:none!important}"
+    "</style>"
+    "<script>document.addEventListener('DOMContentLoaded',function(){switchTab('radar');});</script>"
+    "</body>",
+)
+
+# ── Tali page ─────────────────────────────────────────────────────────────────
+_TALI_HTML = (
+    "<!DOCTYPE html><html lang='en'><head>"
+    "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Tali Ventures</title>"
+    "<style>*{box-sizing:border-box;margin:0;padding:0}"
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+    "background:#fff;display:flex;align-items:center;justify-content:center;"
+    "min-height:100vh;color:#1a1a1a}"
+    "h1{font-size:1.5rem;font-weight:700;text-align:center;color:#1a1a1a}"
+    "</style></head><body>"
+    "<h1>Tali Ventures &mdash; Portal Coming Soon</h1>"
+    "</body></html>"
+)
+
+# ── Login page ────────────────────────────────────────────────────────────────
+def _login_html(error=None):
+    err_block = (
+        f'<div class="login-error">{error}</div>' if error else ""
+    )
+    return (
+        "<!DOCTYPE html><html lang='en'><head>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Stock Analysis — Login</title>"
+        "<style>"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "background:#060b16;min-height:100vh;display:flex;align-items:center;justify-content:center}"
+        ".card{background:#0d1628;border:1px solid #162035;border-radius:16px;padding:44px 40px;"
+        "width:100%;max-width:360px;box-shadow:0 8px 40px rgba(0,0,0,.5)}"
+        "h1{font-size:1.3rem;font-weight:800;"
+        "background:linear-gradient(135deg,#60a5fa,#a78bfa 60%,#38bdf8);"
+        "-webkit-background-clip:text;-webkit-text-fill-color:transparent;"
+        "margin-bottom:6px;letter-spacing:-.4px}"
+        ".sub{color:#3d5475;font-size:.78rem;margin-bottom:28px}"
+        "label{display:block;font-size:.7rem;font-weight:700;letter-spacing:.8px;"
+        "text-transform:uppercase;color:#3d5475;margin-bottom:6px}"
+        "input[type=password]{width:100%;padding:10px 14px;background:#060b16;"
+        "border:1px solid #162035;border-radius:8px;color:#e2e8f0;font-size:.92rem;"
+        "outline:none;transition:border-color .15s}"
+        "input[type=password]:focus{border-color:#3b82f6}"
+        "button{margin-top:16px;width:100%;padding:11px;"
+        "background:linear-gradient(135deg,#2563eb,#4f46e5);"
+        "border:none;border-radius:8px;color:#fff;font-size:.88rem;font-weight:700;"
+        "cursor:pointer;transition:opacity .15s}"
+        "button:hover{opacity:.88}"
+        ".login-error{margin-top:14px;padding:9px 12px;background:rgba(244,67,54,.1);"
+        "border:1px solid rgba(244,67,54,.25);border-radius:7px;"
+        "color:#f44336;font-size:.8rem;text-align:center}"
+        "</style></head><body>"
+        "<div class='card'>"
+        "<h1>&#9654; Stock Analysis</h1>"
+        "<div class='sub'>Enter your access code to continue</div>"
+        "<form method='post'>"
+        "<label>Access Code</label>"
+        "<input type='password' name='password' autofocus placeholder='••••••••••••'>"
+        "<button type='submit'>Enter &rarr;</button>"
+        "</form>"
+        + err_block +
+        "</div></body></html>"
+    )
+
+
 if __name__ == "__main__":
-    print("\n  Stock Analysis Dashboard  →  http://localhost:8080\n")
-    app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 8080))
+    print(f"\n  Stock Analysis Dashboard  →  http://localhost:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
