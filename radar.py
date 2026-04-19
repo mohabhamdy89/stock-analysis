@@ -19,7 +19,9 @@ DEFAULT_WATCHLIST = [
 
 _cache      = {}          # ticker -> {"data": …, "ts": float}
 _cache_lock = threading.Lock()
-CACHE_TTL   = 900         # 15 minutes
+CACHE_TTL        = 900    # 15 minutes (in-memory freshness check)
+CACHE_FILE       = os.path.join(BASE_DIR, "radar_cache.json")
+BG_REFRESH_SECS  = 1800   # 30 minutes
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -35,6 +37,54 @@ def load_watchlist():
 def save_watchlist(tickers):
     with open(WATCHLIST_FILE, "w") as f:
         json.dump({"tickers": tickers}, f, indent=2)
+
+
+# ── File cache ────────────────────────────────────────────────────────────────
+
+def _load_file_cache():
+    """Populate in-memory cache from disk; treat loaded entries as fresh."""
+    try:
+        with open(CACHE_FILE) as f:
+            saved = json.load(f)
+        now = time.time()
+        with _cache_lock:
+            for ticker, entry in saved.items():
+                # Reset ts to now so entries are served without re-fetching
+                _cache[ticker] = {"data": entry["data"], "ts": now}
+    except Exception:
+        pass
+
+
+def _save_file_cache():
+    """Write current in-memory cache to disk."""
+    try:
+        with _cache_lock:
+            snapshot = dict(_cache)
+        with open(CACHE_FILE, "w") as f:
+            json.dump(snapshot, f)
+    except Exception:
+        pass
+
+
+def _bg_refresh_loop():
+    """Background daemon: refresh all watchlist tickers every 30 minutes."""
+    while True:
+        time.sleep(BG_REFRESH_SECS)
+        try:
+            for ticker in load_watchlist():
+                try:
+                    data = fetch_radar_stock(ticker)
+                    with _cache_lock:
+                        _cache[ticker] = {"data": data, "ts": time.time()}
+                except Exception:
+                    pass
+            _save_file_cache()
+        except Exception:
+            pass
+
+
+_load_file_cache()
+threading.Thread(target=_bg_refresh_loop, daemon=True).start()
 
 
 # ── News sentiment ─────────────────────────────────────────────────────────────
@@ -382,4 +432,5 @@ def get_all_radar(tickers, force=False):
                 "ticker": ticker, "composite": 0, "error": str(e),
                 "signal": "N/A", "price": "N/A",
             })
+    _save_file_cache()
     return results
