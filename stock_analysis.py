@@ -573,18 +573,20 @@ def read_portfolio_sheet():
     except ImportError:
         return {}, {}, 0.0, None
 
-    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CREDENTIALS_FILE)
-    if not os.path.exists(creds_path):
-        return {}, {}, 0.0, None
-
+    _scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
     try:
-        creds = _C.from_service_account_file(
-            creds_path,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets.readonly",
-                "https://www.googleapis.com/auth/drive.readonly",
-            ],
-        )
+        _creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if _creds_json:
+            import json as _json
+            creds = _C.from_service_account_info(_json.loads(_creds_json), scopes=_scopes)
+        else:
+            creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CREDENTIALS_FILE)
+            if not os.path.exists(creds_path):
+                return {}, {}, 0.0, None
+            creds = _C.from_service_account_file(creds_path, scopes=_scopes)
         rows = gspread.authorize(creds).open(GOOGLE_SHEET_NAME).sheet1.get_all_values()
     except Exception as e:
         print(f"  ⚠  Google Sheets: {e}")
