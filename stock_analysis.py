@@ -113,12 +113,12 @@ def score_stock(ticker: str):
 
     # 1. RSI
     r = calc_rsi(close).iloc[-1]
-    if r < 30:
-        scores["RSI"] = 1;  details["RSI"] = f"{r:.1f}  Oversold — Bullish"
-    elif r > 70:
-        scores["RSI"] = -1; details["RSI"] = f"{r:.1f}  Overbought — Bearish"
+    if r < 25:
+        scores["RSI"] = 1;  details["RSI"] = f"RSI={r:.1f}  Oversold — Bullish"
+    elif r > 80:
+        scores["RSI"] = -1; details["RSI"] = f"RSI={r:.1f}  Overbought — Bearish"
     else:
-        scores["RSI"] = 0;  details["RSI"] = f"{r:.1f}  Neutral"
+        scores["RSI"] = 0;  details["RSI"] = f"RSI={r:.1f}  Neutral"
 
     # 2. MACD
     ml, sl = calc_macd(close)

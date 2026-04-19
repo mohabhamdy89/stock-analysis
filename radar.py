@@ -95,16 +95,31 @@ _NEG = {"miss","missed","weak","fall","drop","decline","downgrade","underperform
         "loss","cut","concern","lawsuit","investigation","bearish","layoff","warning",
         "tumbles","slumps","falls","drops","lowers"}
 
-def _news_sentiment(ticker):
+def _news_sentiment(ticker, company_name=""):
     try:
         url = (f"https://feeds.finance.yahoo.com/rss/2.0/headline"
                f"?s={ticker}&region=US&lang=en-US")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as r:
             root = ET.fromstring(r.read())
-        titles = [item.findtext("title", "") for item in root.iter("item")][:5]
+        all_titles = [item.findtext("title", "") for item in root.iter("item")]
+
+        # Keep only headlines that mention the ticker or a key word from the company name
+        tk_lower = ticker.lower().replace("-", "")
+        name_words = {w.lower() for w in company_name.split() if len(w) > 3}
+        def _relevant(title):
+            tl = title.lower()
+            if tk_lower in tl.replace("-", "").replace(".", ""):
+                return True
+            return any(w in tl for w in name_words)
+
+        titles = [t for t in all_titles if _relevant(t)][:5]
+        # Fall back to all fetched titles rather than returning nothing
+        if not titles:
+            titles = all_titles[:3]
         if not titles:
             return "N/A", []
+
         pos = neg = 0
         for t in titles:
             words = set(t.lower().replace(",", "").replace(".", "").split())
@@ -297,7 +312,7 @@ def fetch_radar_stock(ticker):
         pass
 
     # ── Sentiment
-    sentiment, headlines = _news_sentiment(ticker)
+    sentiment, headlines = _news_sentiment(ticker, company_name=name)
 
     # ── Technical
     tech = _technical(ticker)
