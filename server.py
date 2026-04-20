@@ -4,7 +4,7 @@ Stock Analysis Live Dashboard Server  —  http://localhost:8080
 Reads live portfolio from Google Sheets, runs 10 technical indicators,
 streams real-time updates, and generates Portfolio Advisor recommendations.
 """
-import json, os, sys, threading
+import json, os, sys, threading, time
 from datetime import datetime
 from functools import wraps
 from flask import Flask, Response, jsonify, request, session, redirect, url_for
@@ -63,6 +63,71 @@ _portfolio_totals= {}
 _benchmarks      = {}
 _updated         = None
 _busy            = False
+
+BG_PORTFOLIO_INTERVAL = 1800  # 30 minutes
+
+
+def _run_portfolio_refresh():
+    """Fetch portfolio from Sheets, score all stocks, enrich, store in _results."""
+    global _results, _advisor_recs, _portfolio_totals, _benchmarks, _updated, _busy
+    with _lock:
+        if _busy:
+            return
+        _busy = True
+    try:
+        sheet_portfolios, positions, cash, portfolio_pnl_pct = read_portfolio_sheet()
+        active = sheet_portfolios if sheet_portfolios else PORTFOLIOS
+        if not sheet_portfolios:
+            cash, portfolio_pnl_pct = 0.0, None
+
+        raw = {n: [] for n in active}
+        for pname, tickers in active.items():
+            for ticker in tickers:
+                try:
+                    r = score_stock(ticker)
+                    if r:
+                        raw[pname].append(r)
+                except Exception:
+                    pass
+
+        enriched_portfolios, totals = {}, {}
+        all_enriched = []
+        for pname, results in raw.items():
+            enriched, ptotals = enrich_with_portfolio(results, positions, cash, portfolio_pnl_pct)
+            enriched_portfolios[pname] = enriched
+            all_enriched.extend(enriched)
+            totals = ptotals
+
+        advisor = generate_advisor_recs(all_enriched)
+        bm = {}
+        try:
+            bm = fetch_benchmark_returns()
+        except Exception:
+            pass
+
+        ts = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
+        with _lock:
+            _results          = enriched_portfolios
+            _advisor_recs     = advisor
+            _portfolio_totals = totals
+            _benchmarks       = bm
+            _updated          = ts
+    except Exception:
+        pass
+    finally:
+        with _lock:
+            _busy = False
+
+
+def _bg_portfolio_loop():
+    """Daemon: load portfolio on startup, then refresh every 30 min."""
+    _run_portfolio_refresh()
+    while True:
+        time.sleep(BG_PORTFOLIO_INTERVAL)
+        _run_portfolio_refresh()
+
+
+threading.Thread(target=_bg_portfolio_loop, daemon=True).start()
 
 
 # ── Serialization ──────────────────────────────────────────────────────────────
