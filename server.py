@@ -17,6 +17,8 @@ from stock_analysis import (
 )
 from radar import get_all_radar, get_radar_stock, load_watchlist, save_watchlist
 from radar_ui import RADAR_CSS, RADAR_JS, RADAR_HTML
+from news_terminal import get_all_news
+from news_ui import NEWS_CSS, NEWS_JS, NEWS_HTML
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-local-key-change-in-prod")
@@ -321,6 +323,21 @@ def api_radar_stock(ticker):
     return jsonify(data)
 
 
+# ── News Terminal route ────────────────────────────────────────────────────────
+
+@app.route("/api/news")
+@_api_require("full", "radar_only")
+def api_news():
+    force = request.args.get("force") == "1"
+    try:
+        portfolios, _, _, _ = read_portfolio_sheet()
+        tickers = [t for ts in portfolios.values() for t in ts]
+    except Exception:
+        tickers = []
+    data = get_all_news(tickers, force=force)
+    return jsonify(data)
+
+
 # ── CSS ────────────────────────────────────────────────────────────────────────
 
 _CSS = """
@@ -468,7 +485,7 @@ thead th.s.desc::after{content:' ▼';opacity:1;color:#3b82f6;font-size:.8em}
 thead th.s.asc::after{content:' ▲';opacity:1;color:#3b82f6;font-size:.8em}
 thead th.s.desc,thead th.s.asc{color:#475569}
 @media(max-width:900px){.hdr{padding:14px 16px;flex-direction:column;gap:8px}.main{padding:16px}.pstrip{flex-wrap:wrap}.adv-grid{grid-template-columns:1fr}.tab-bar{padding:0 16px}}
-""" + RADAR_CSS
+""" + RADAR_CSS + NEWS_CSS
 
 
 # ── JS ─────────────────────────────────────────────────────────────────────────
@@ -493,6 +510,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + name));
   if (name === 'radar' && !radarInitialized) { radarInitialized = true; initRadar(); }
+  if (name === 'news'  && !newsInitialized)  { newsInitialized  = true; initNews();  }
 }
 
 let evtSource    = null;
@@ -856,7 +874,7 @@ window.addEventListener('load', function() {
     }
   }).catch(()=>startRefresh());
 });
-""" + RADAR_JS
+""" + RADAR_JS + NEWS_JS
 
 
 # ── HTML template ──────────────────────────────────────────────────────────────
@@ -943,11 +961,7 @@ _HTML = (
 
     # ── News Terminal tab ─────────────────────────────────────────────────────
     '<div class="tab-content" id="tab-news">'
-    '<div class="coming-soon">'
-    '<div class="cs-icon">&#128240;</div>'
-    '<h2>News Terminal</h2>'
-    '<p>Coming soon</p>'
-    '</div>'
+    + NEWS_HTML +
     '</div>'
 
     '<div class="footer">Portfolio data from Google Sheets &nbsp;·&nbsp; Prices from Yahoo Finance &nbsp;·&nbsp; '
