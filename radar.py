@@ -17,11 +17,12 @@ DEFAULT_WATCHLIST = [
     "BRK.B","LLY","AVGO","JPM","TSLA","COST","NFLX",
 ]
 
+RADAR_REFRESH_SECS = 1800  # 30 minutes — background refresh + per-ticker TTL
+
 _cache      = {}          # ticker -> {"data": …, "ts": float}
 _cache_lock = threading.Lock()
-CACHE_TTL        = 900    # 15 minutes (in-memory freshness check)
-CACHE_FILE       = os.path.join(BASE_DIR, "radar_cache.json")
-BG_REFRESH_SECS  = 1800   # 30 minutes
+CACHE_TTL   = RADAR_REFRESH_SECS
+CACHE_FILE  = os.path.join(BASE_DIR, "radar_cache.json")
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -67,9 +68,9 @@ def _save_file_cache():
 
 
 def _bg_refresh_loop():
-    """Background daemon: refresh all watchlist tickers every 30 minutes."""
+    """Background daemon: refresh all watchlist tickers every RADAR_REFRESH_SECS."""
     while True:
-        time.sleep(BG_REFRESH_SECS)
+        time.sleep(RADAR_REFRESH_SECS)
         try:
             for ticker in load_watchlist():
                 try:

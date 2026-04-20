@@ -113,15 +113,16 @@ def fetch_portfolio_news(tickers):
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
 
+NEWS_REFRESH_SECS = 900  # 15 minutes — news headline cache TTL
+
 _cache      = {"data": None, "ts": 0.0}
 _cache_lock = threading.Lock()
-NEWS_TTL    = 900  # 15 minutes
 
 
 def get_all_news(tickers, force=False):
     with _cache_lock:
         if (not force and _cache["data"] is not None
-                and (time.time() - _cache["ts"]) < NEWS_TTL):
+                and (time.time() - _cache["ts"]) < NEWS_REFRESH_SECS):
             return _cache["data"]
     data = {
         "hot":       fetch_hot_news(),

@@ -58,6 +58,9 @@ def _api_require(*levels):
         return wrapped
     return decorator
 
+PRICE_REFRESH_SECS     = 300   # 5 minutes  — Yahoo Finance live prices + scores
+PORTFOLIO_REFRESH_SECS = 900   # 15 minutes — Google Sheets positions
+
 _lock            = threading.Lock()
 _results         = {}   # {portfolio_name: [enriched result dicts]}
 _advisor_recs    = []
@@ -66,18 +69,26 @@ _benchmarks      = {}
 _updated         = None
 _busy            = False
 
-BG_PORTFOLIO_INTERVAL = 1800  # 30 minutes
+# Cached Google Sheets data — re-read every PORTFOLIO_REFRESH_SECS
+_sheets_data = None   # (sheet_portfolios, positions, cash, portfolio_pnl_pct)
+_sheets_ts   = 0.0
 
 
 def _run_portfolio_refresh():
-    """Fetch portfolio from Sheets, score all stocks, enrich, store in _results."""
+    """Score all stocks and enrich with portfolio data. Re-reads Sheets only when stale."""
     global _results, _advisor_recs, _portfolio_totals, _benchmarks, _updated, _busy
+    global _sheets_data, _sheets_ts
     with _lock:
         if _busy:
             return
         _busy = True
     try:
-        sheet_portfolios, positions, cash, portfolio_pnl_pct = read_portfolio_sheet()
+        # Re-read Google Sheets only when cache is stale (every 15 min)
+        if _sheets_data is None or (time.time() - _sheets_ts) >= PORTFOLIO_REFRESH_SECS:
+            _sheets_data = read_portfolio_sheet()
+            _sheets_ts   = time.time()
+
+        sheet_portfolios, positions, cash, portfolio_pnl_pct = _sheets_data
         active = sheet_portfolios if sheet_portfolios else PORTFOLIOS
         if not sheet_portfolios:
             cash, portfolio_pnl_pct = 0.0, None
@@ -122,10 +133,10 @@ def _run_portfolio_refresh():
 
 
 def _bg_portfolio_loop():
-    """Daemon: load portfolio on startup, then refresh every 30 min."""
+    """Daemon: load portfolio on startup, then refresh prices every 5 min."""
     _run_portfolio_refresh()
     while True:
-        time.sleep(BG_PORTFOLIO_INTERVAL)
+        time.sleep(PRICE_REFRESH_SECS)
         _run_portfolio_refresh()
 
 
