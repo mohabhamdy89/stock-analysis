@@ -45,8 +45,7 @@ def fetch_market_overview():
     results = {}
     for name, sym in symbols.items():
         try:
-            t = yf.Ticker(sym)
-            hist = t.history(period="5d", interval="1d")
+            hist = yf.Ticker(sym).history(period="5d", interval="1d")
             if hist.empty:
                 continue
             last  = float(hist["Close"].iloc[-1])
@@ -79,17 +78,50 @@ def fetch_ytd_benchmarks():
     return out
 
 
-# ── 2. Macro News ──────────────────────────────────────────────────────────────
+# ── 2. Macro News — filtered to genuine macro events ──────────────────────────
+
+# Keywords that qualify a headline as macro-relevant
+_MACRO_KEEP = {
+    "fed", "federal reserve", "fomc", "powell", "rate", "interest rate",
+    "inflation", "cpi", "pce", "ppi", "deflation", "gdp", "recession",
+    "jobs", "payroll", "unemployment", "nonfarm", "labor",
+    "tariff", "trade war", "sanction", "trade deal", "wto",
+    "geopolit", "war", "conflict", "invasion", "nato", "iran", "russia",
+    "ukraine", "china", "opec", "oil supply", "crude supply",
+    "dollar", "euro", "yen", "yuan", "currency", "forex", "dxy",
+    "treasury", "yield curve", "10-year", "bond", "debt ceiling",
+    "bank crisis", "credit", "liquidity", "systemic",
+    "earnings season", "gdp growth", "economic growth",
+}
+
+# Keywords that disqualify a headline (ETF picks, stock recommendations)
+_MACRO_REJECT = {
+    "best etf", "top etf", "etf to buy", "stock to buy", "stocks to buy",
+    "best stock", "top stock", "analyst upgrade", "analyst downgrade",
+    "price target", "stock pick", "dividend stock", "growth stock",
+    "penny stock", "meme stock", "why i bought", "should you buy",
+    "motley fool", "zacks rank",
+}
+
+
+def _is_macro(title: str) -> bool:
+    tl = title.lower()
+    if any(r in tl for r in _MACRO_REJECT):
+        return False
+    return any(k in tl for k in _MACRO_KEEP)
+
 
 def fetch_macro_news(max_items=6):
-    import urllib.request, xml.etree.ElementTree as ET, ssl
-    ctx = ssl._create_unverified_context()
+    import urllib.request, xml.etree.ElementTree as ET, ssl as _ssl
+    ctx = _ssl._create_unverified_context()
     feeds = [
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US",
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY&region=US&lang=en-US",
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EVIX&region=US&lang=en-US",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5ETNX&region=US&lang=en-US",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=GC%3DF&region=US&lang=en-US",
     ]
-    seen, items = set(), []
+    seen, all_items = set(), []
     for url in feeds:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -102,12 +134,15 @@ def fetch_macro_news(max_items=6):
                 if not title or title in seen:
                     continue
                 seen.add(title)
-                items.append({"title": title, "link": link, "pub": pub})
-                if len(items) >= max_items * 2:
-                    break
+                all_items.append({"title": title, "link": link, "pub": pub})
         except Exception:
             pass
-    return items[:max_items]
+
+    # Prefer genuine macro headlines; fall back to all if not enough
+    macro = [i for i in all_items if _is_macro(i["title"])]
+    if len(macro) < 3:
+        macro = all_items  # fallback: use everything
+    return macro[:max_items]
 
 
 # ── 3. Insider Activity ────────────────────────────────────────────────────────
@@ -119,8 +154,7 @@ def fetch_insider_activity(tickers):
     cutoff = datetime.now() - timedelta(days=30)
     for tk in tickers:
         try:
-            t = yf.Ticker(tk)
-            df = t.insider_transactions
+            df = yf.Ticker(tk).insider_transactions
             if df is None or df.empty:
                 continue
             for _, r in df.iterrows():
@@ -132,28 +166,25 @@ def fetch_insider_activity(tickers):
                     value  = float(r.get("Value", r.get("value", 0)) or 0)
                     if shares <= 0 or value <= 0:
                         continue
-                    name   = str(r.get("Insider", r.get("Name", "Unknown"))).strip()
-                    title  = str(r.get("Position", r.get("Title", ""))).strip()
-                    tx_date_raw = r.get("Date", r.get("date"))
-                    if isinstance(tx_date_raw, str):
-                        try:
-                            tx_date = pd.to_datetime(tx_date_raw).to_pydatetime().replace(tzinfo=None)
-                        except Exception:
-                            tx_date = datetime.now()
-                    elif hasattr(tx_date_raw, "to_pydatetime"):
-                        tx_date = tx_date_raw.to_pydatetime().replace(tzinfo=None)
+                    name  = str(r.get("Insider", r.get("Name", "Unknown"))).strip()
+                    title = str(r.get("Position", r.get("Title", ""))).strip()
+                    raw   = r.get("Date", r.get("date"))
+                    if isinstance(raw, str):
+                        tx_date = pd.to_datetime(raw).to_pydatetime().replace(tzinfo=None)
+                    elif hasattr(raw, "to_pydatetime"):
+                        tx_date = raw.to_pydatetime().replace(tzinfo=None)
                     else:
                         tx_date = datetime.now()
                     if tx_date < cutoff:
                         continue
                     rows.append({
-                        "ticker":  tk,
-                        "name":    name[:28],
-                        "title":   title[:24],
-                        "shares":  shares,
-                        "value":   value,
-                        "date":    tx_date.strftime("%b %d"),
-                        "signal":  "BUY",
+                        "ticker": tk,
+                        "name":   name[:28],
+                        "title":  title[:24],
+                        "shares": shares,
+                        "value":  value,
+                        "date":   tx_date.strftime("%b %d"),
+                        "signal": "BUY",
                     })
                 except Exception:
                     continue
@@ -177,7 +208,7 @@ def fetch_portfolio():
                                     score_stock, fetch_benchmark_returns)
         sheet_p, positions, cash, pnl_pct = read_portfolio_sheet()
         if not sheet_p:
-            return [], {}, 0.0, None, None
+            return [], {}, 0.0, None, None, {}
         tickers = list(positions.keys())
         raw_results = []
         for tk in tickers:
@@ -195,7 +226,8 @@ def fetch_portfolio():
 # ── 5. Radar / Watchlist ───────────────────────────────────────────────────────
 
 def fetch_radar_top(n=5):
-    cache_path = os.path.join(BASE_DIR, "radar_cache.json")
+    import yfinance as yf
+    cache_path    = os.path.join(BASE_DIR, "radar_cache.json")
     watchlist_path = os.path.join(BASE_DIR, "watchlist.json")
     try:
         tickers = json.load(open(watchlist_path))["tickers"]
@@ -206,16 +238,15 @@ def fetch_radar_top(n=5):
     except Exception:
         cache = {}
 
-    import yfinance as yf
     stocks = []
     for tk in tickers:
         try:
-            entry = cache.get(tk, {}).get("data", {})
-            score = float(entry.get("score_hybrid") or entry.get("composite") or 5.0)
-            sig   = str(entry.get("sig_hybrid") or entry.get("signal") or "Neutral")
-            price = entry.get("price")
+            entry  = cache.get(tk, {}).get("data", {})
+            score  = float(entry.get("score_hybrid") or entry.get("composite") or 5.0)
+            sig    = str(entry.get("sig_hybrid") or entry.get("signal") or "Neutral")
+            price  = entry.get("price")
             if price in (None, "N/A", ""):
-                info = yf.Ticker(tk).info
+                info  = yf.Ticker(tk).info
                 price = info.get("regularMarketPrice") or info.get("currentPrice") or 0
             upside = entry.get("upside", "N/A")
             earn   = entry.get("earn_date", "N/A")
@@ -229,13 +260,13 @@ def fetch_radar_top(n=5):
                 elif rsi_v > 70:
                     note = "RSI Overbought"
             stocks.append({
-                "ticker":  tk,
-                "score":   round(score, 2),
-                "signal":  sig,
-                "price":   price,
-                "upside":  upside,
+                "ticker":   tk,
+                "score":    round(score, 2),
+                "signal":   sig,
+                "price":    price,
+                "upside":   upside,
                 "earnings": earn,
-                "note":    note,
+                "note":     note,
             })
         except Exception:
             pass
@@ -243,9 +274,9 @@ def fetch_radar_top(n=5):
     return stocks[:n]
 
 
-# ── 6. AI Analysis (Claude API or fallback) ───────────────────────────────────
+# ── 6. AI Analysis (Claude API) ───────────────────────────────────────────────
 
-def _call_claude(prompt, max_tokens=400):
+def _call_claude(prompt, max_tokens=600):
     if not ANTHROPIC_KEY:
         return None
     try:
@@ -263,108 +294,198 @@ def _call_claude(prompt, max_tokens=400):
 
 
 def generate_executive_summary(market, benchmarks, portfolio_totals, insider_rows):
-    sp_chg  = market.get("S&P 500", {}).get("change_pct", 0.0)
-    vix     = market.get("VIX", {}).get("price", 0.0)
-    sp_ytd  = benchmarks.get("sp500", 0.0)
+    sp_chg   = market.get("S&P 500", {}).get("change_pct", 0.0)
+    vix      = market.get("VIX", {}).get("price", 0.0)
+    gold_chg = market.get("Gold", {}).get("change_pct", 0.0)
+    oil_chg  = market.get("WTI Oil", {}).get("change_pct", 0.0)
+    tsy_px   = market.get("10-Yr UST", {}).get("price", 0.0)
+    sp_ytd   = benchmarks.get("sp500", 0.0)
     port_ytd = (portfolio_totals or {}).get("sheet_pnl_pct") if portfolio_totals else None
     n_insider = len(insider_rows)
 
     if ANTHROPIC_KEY:
         port_line = (f"Portfolio YTD: {port_ytd:+.1f}%" if port_ytd is not None
-                     else "Portfolio data from Google Sheets")
-        insider_line = (f"{n_insider} open-market insider purchases detected in portfolio holdings."
+                     else "Portfolio data unavailable")
+        bps_line  = ""
+        if port_ytd is not None and sp_ytd:
+            bps = int(round((port_ytd - sp_ytd) * 100))
+            bps_line = (f"Portfolio outperforming S&P 500 by {abs(bps)}bps YTD."
+                        if bps > 0 else f"Portfolio underperforming S&P 500 by {abs(bps)}bps YTD.")
+        insider_line = (f"{n_insider} open-market insider purchase{'s' if n_insider != 1 else ''} "
+                        "detected across holdings."
                         if n_insider > 0 else "No material insider transactions today.")
         prompt = (
-            "You are a senior market strategist at a top investment bank. "
-            "Write a 3-sentence executive summary for a professional daily market intelligence brief. "
-            "Be specific, use the data provided, lead with the most important insight. "
-            "No emojis. No bullet points. Plain prose only.\n\n"
-            f"Market data:\n"
+            "You are a senior market strategist at Goldman Sachs. "
+            "Write a 3-sentence executive summary for a professional daily intelligence brief. "
+            "Lead with the single most important market development. "
+            "Reference specific numbers. No emojis. No bullet points. Plain prose only.\n\n"
+            f"Market snapshot:\n"
             f"- S&P 500 prior session: {sp_chg:+.2f}%\n"
-            f"- VIX: {vix:.1f}\n"
+            f"- VIX: {vix:.1f} ({'elevated' if vix > 20 else 'low'})\n"
+            f"- 10-Year Treasury: {tsy_px:.2f}%\n"
+            f"- Gold: {gold_chg:+.2f}%, WTI Oil: {oil_chg:+.2f}%\n"
             f"- S&P 500 YTD: {sp_ytd:+.1f}%\n"
             f"- {port_line}\n"
+            f"- {bps_line}\n"
             f"- {insider_line}\n\n"
             "Write exactly 3 sentences."
         )
-        result = _call_claude(prompt, max_tokens=200)
+        result = _call_claude(prompt, max_tokens=250)
         if result:
             return result
 
-    # Intelligent fallback
-    mood = "cautious" if vix > 20 else ("risk-on" if sp_chg > 0.5 else "mixed")
-    sp_str = f"{sp_chg:+.2f}%" if sp_chg else "flat"
-    summary_lines = [
+    # Fallback
+    mood   = "cautious" if vix > 20 else ("risk-on" if sp_chg > 0.5 else "mixed")
+    sp_str = f"{sp_chg:+.2f}%"
+    lines  = [
         f"Equity markets closed {sp_str} in the prior session with VIX at {vix:.1f}, "
         f"reflecting a {mood} tone among institutional participants.",
     ]
-    if port_ytd is not None:
-        bench_diff = port_ytd - sp_ytd if sp_ytd else 0
-        summary_lines.append(
-            f"Portfolio stands {port_ytd:+.1f}% YTD, "
-            + (f"outperforming the S&P 500 by {abs(bench_diff):.0f}bps."
-               if bench_diff > 0 else f"tracking the S&P 500 benchmark.")
+    if port_ytd is not None and sp_ytd:
+        bps = int(round((port_ytd - sp_ytd) * 100))
+        lines.append(
+            f"Portfolio stands {port_ytd:+.1f}% YTD versus S&P 500 at {sp_ytd:+.1f}%, "
+            + (f"outperforming by {abs(bps)}bps." if bps > 0 else f"underperforming by {abs(bps)}bps.")
         )
     if n_insider > 0:
-        summary_lines.append(
-            f"{n_insider} open-market insider purchase{'s' if n_insider > 1 else ''} "
-            f"detected across holdings — a historically constructive signal."
+        lines.append(
+            f"{n_insider} open-market insider purchase{'s' if n_insider != 1 else ''} "
+            "detected — a historically constructive signal."
         )
-    return " ".join(summary_lines)
+    return " ".join(lines)
 
 
-def generate_macro_analysis(headline):
+def generate_market_narrative(market, news_items, portfolio_enriched,
+                               portfolio_totals, bench, radar_stocks):
+    """2-paragraph Goldman Sachs-style narrative referencing specific data."""
+    if not ANTHROPIC_KEY:
+        return None
+
+    sp_chg   = market.get("S&P 500", {}).get("change_pct", 0.0)
+    sp_price = market.get("S&P 500", {}).get("price", 0.0)
+    vix      = market.get("VIX", {}).get("price", 0.0)
+    gold_chg = market.get("Gold", {}).get("change_pct", 0.0)
+    oil_chg  = market.get("WTI Oil", {}).get("change_pct", 0.0)
+    tsy      = market.get("10-Yr UST", {}).get("price", 0.0)
+    sp_ytd   = (bench or {}).get("sp500", {}).get("return_ytd", 0.0) if bench else 0.0
+
+    port_ytd = (portfolio_totals or {}).get("sheet_pnl_pct") or 0.0
+    port_val = (portfolio_totals or {}).get("total_portfolio_value") or 0.0
+    tot_pnl  = (portfolio_totals or {}).get("total_unrealized_pnl") or 0.0
+
+    headlines = "\n".join(f"- {i['title']}" for i in news_items[:5])
+
+    holdings_summary = ""
+    if portfolio_enriched:
+        top = sorted(portfolio_enriched, key=lambda x: x.get("market_value", 0), reverse=True)[:5]
+        parts = []
+        for h in top:
+            sig    = h.get("signal", "")
+            # Recompute P&L % consistently from live price
+            shares    = float(h.get("shares", 0))
+            cost_ps   = float(h.get("cost_basis_ps", 0))
+            price     = float(h.get("price", 0))
+            total_cost = shares * cost_ps
+            mv         = shares * price
+            pnl_p = ((mv - total_cost) / total_cost * 100) if total_cost else 0.0
+            parts.append(f"{h['ticker']} ({sig}, {pnl_p:+.1f}%)")
+        holdings_summary = ", ".join(parts)
+
+    radar_summary = ", ".join(
+        f"{r['ticker']} score {r['score']}/10" for r in radar_stocks[:3]
+    )
+
+    prompt = (
+        "You are a senior portfolio strategist at Goldman Sachs writing the morning intelligence brief. "
+        "Write exactly 2 paragraphs of professional market narrative. Rules:\n"
+        "- Reference specific numbers from the data below\n"
+        "- Paragraph 1: Connect today's macro environment to what it means for risk assets broadly\n"
+        "- Paragraph 2: Identify the single biggest risk and biggest opportunity for the portfolio today, "
+        "naming specific holdings or watchlist names\n"
+        "- Sound like a senior analyst, not a bot\n"
+        "- No emojis. No headers. No bullet points. Plain prose only.\n\n"
+        f"MARKET DATA:\n"
+        f"S&P 500: {sp_price:,.0f} ({sp_chg:+.2f}% session), YTD {sp_ytd:+.1f}%\n"
+        f"VIX: {vix:.1f} | 10-Yr Treasury: {tsy:.2f}% | Gold: {gold_chg:+.2f}% | WTI: {oil_chg:+.2f}%\n\n"
+        f"TOP MACRO HEADLINES:\n{headlines}\n\n"
+        f"PORTFOLIO: ${port_val:,.0f} total, {port_ytd:+.1f}% YTD, "
+        f"unrealized P&L ${tot_pnl:+,.0f}\n"
+        f"Top holdings: {holdings_summary}\n\n"
+        f"WATCHLIST TOP SCORES: {radar_summary}\n\n"
+        "Write 2 paragraphs now."
+    )
+    return _call_claude(prompt, max_tokens=500)
+
+
+def generate_macro_analysis(headline, portfolio_tickers):
+    """Returns dict with IMPACT, SECTORS, ANALYSIS (4 sentences), RELEVANCE."""
     if ANTHROPIC_KEY:
+        tickers_str = ", ".join(portfolio_tickers[:10]) if portfolio_tickers else "none specified"
         prompt = (
-            "You are a senior market analyst. Analyze this news headline and provide:\n"
-            "1. IMPACT: exactly one word — BULLISH, BEARISH, or NEUTRAL\n"
-            "2. SECTORS: comma-separated list of up to 3 affected sectors (e.g. Technology, Financials, Energy)\n"
-            "3. ANALYSIS: one crisp sentence (max 20 words) explaining the investment implication\n"
-            "4. RELEVANCE: HIGH or MEDIUM\n\n"
-            f"Headline: {headline}\n\n"
-            "Respond in this exact format (no extra text):\n"
-            "IMPACT: [BULLISH/BEARISH/NEUTRAL]\n"
-            "SECTORS: [sectors]\n"
-            "ANALYSIS: [one sentence]\n"
-            "RELEVANCE: [HIGH/MEDIUM]"
+            "You are a senior market analyst at JP Morgan. "
+            f"Analyze this macro headline for a professional investor with these holdings: {tickers_str}\n\n"
+            f"Headline: \"{headline}\"\n\n"
+            "Respond in this EXACT format — no extra text, no markdown:\n\n"
+            "IMPACT: [BULLISH / BEARISH / NEUTRAL]\n"
+            "SECTORS: [up to 3 sectors, comma-separated]\n"
+            "RELEVANCE: [HIGH / MEDIUM]\n"
+            "ANALYSIS: [4 sentences:\n"
+            "  Sentence 1 — What happened (the objective facts from the headline)\n"
+            "  Sentence 2 — Why this matters for financial markets right now\n"
+            f"  Sentence 3 — Specific impact on holdings ({tickers_str}) or the broader portfolio\n"
+            "  Sentence 4 — What to watch for next / the key risk or catalyst ahead]"
         )
-        result = _call_claude(prompt, max_tokens=120)
+        result = _call_claude(prompt, max_tokens=300)
         if result:
             parsed = {}
-            for line in result.strip().splitlines():
-                if ":" in line:
+            # Split off the ANALYSIS block (it may span multiple lines)
+            lines = result.strip().splitlines()
+            analysis_lines = []
+            in_analysis = False
+            for line in lines:
+                if line.upper().startswith("ANALYSIS:"):
+                    in_analysis = True
+                    rest = line[len("ANALYSIS:"):].strip()
+                    if rest:
+                        analysis_lines.append(rest)
+                elif in_analysis:
+                    analysis_lines.append(line.strip())
+                elif ":" in line and not in_analysis:
                     k, v = line.split(":", 1)
                     parsed[k.strip().upper()] = v.strip()
+            if analysis_lines:
+                parsed["ANALYSIS"] = " ".join(a for a in analysis_lines if a)
             if "IMPACT" in parsed:
                 return parsed
+
     # Fallback heuristics
-    h = headline.lower()
-    neg_words = {"fall","drop","decline","cut","warn","weak","miss","slump","crash","concern","risk"}
-    pos_words = {"rise","gain","beat","surge","strong","upgrade","rally","growth","record","jump"}
-    neg = sum(1 for w in neg_words if w in h)
-    pos = sum(1 for w in pos_words if w in h)
+    h   = headline.lower()
+    neg = sum(1 for w in {"fall","drop","decline","cut","warn","weak","miss","slump","crash"} if w in h)
+    pos = sum(1 for w in {"rise","gain","beat","surge","strong","upgrade","rally","growth","jump"} if w in h)
     impact    = "BULLISH" if pos > neg else ("BEARISH" if neg > pos else "NEUTRAL")
-    relevance = "HIGH" if any(x in h for x in ["fed","rate","inflation","gdp","jobs","earnings"]) else "MEDIUM"
-    sector    = "Broad Market"
-    if any(x in h for x in ["tech","ai","chip","semicon","software","nvidia","apple","microsoft"]):
+    relevance = "HIGH" if any(x in h for x in ["fed","rate","inflation","gdp","jobs","tariff","war"]) else "MEDIUM"
+    sector = "Broad Market"
+    if any(x in h for x in ["tech","ai","chip","nvidia","apple","microsoft","software"]):
         sector = "Technology"
-    elif any(x in h for x in ["bank","rate","fed","treasury","yield","credit"]):
+    elif any(x in h for x in ["bank","fed","rate","treasury","yield","credit"]):
         sector = "Financials"
-    elif any(x in h for x in ["oil","energy","gas","crude"]):
+    elif any(x in h for x in ["oil","energy","gas","crude","opec"]):
         sector = "Energy"
-    elif any(x in h for x in ["consumer","retail","spending"]):
-        sector = "Consumer"
     return {
         "IMPACT":    impact,
         "SECTORS":   sector,
-        "ANALYSIS":  "Monitor developments for potential portfolio impact.",
+        "ANALYSIS":  (
+            f"This development reflects ongoing uncertainty in macro conditions. "
+            f"Markets are likely to reprice risk assets in response. "
+            f"Portfolio holdings with rate or commodity sensitivity may see near-term volatility. "
+            f"Watch for follow-through in the next session and any central bank commentary."
+        ),
         "RELEVANCE": relevance,
     }
 
 
 # ── 7. HTML Builder ────────────────────────────────────────────────────────────
 
-# Color palette
 NAVY    = "#0B1F3A"
 NAVY_LT = "#1a3256"
 WHITE   = "#FFFFFF"
@@ -375,54 +496,43 @@ GREEN   = "#16A34A"
 RED     = "#DC2626"
 GOLD    = "#B45309"
 
+
 def _fmt_price(v):
     if v is None:
         return "N/A"
     try:
         v = float(v)
+        if v == 0:
+            return "N/A"
         return f"${v:,.2f}" if v >= 1 else f"${v:.4f}"
     except Exception:
         return "N/A"
 
-def _fmt_chg(v):
-    try:
-        v = float(v)
-        sign = "+" if v >= 0 else ""
-        return f"{sign}{v:.2f}%"
-    except Exception:
-        return "N/A"
-
-def _chg_color(v):
-    try:
-        return GREEN if float(v) >= 0 else RED
-    except Exception:
-        return GRAY
 
 def _sig_badge(sig):
-    sig = str(sig).upper()
+    sig = str(sig).upper().strip()
     styles = {
-        "STRONG BUY":  (GREEN,   "#DCFCE7"),
+        "STRONG BUY":  (GREEN,    "#DCFCE7"),
         "BUY":         ("#15803D","#D1FAE5"),
-        "NEUTRAL":     (GOLD,    "#FEF3C7"),
+        "NEUTRAL":     (GOLD,     "#FEF3C7"),
         "SELL":        ("#EA580C","#FFEDD5"),
-        "STRONG SELL": (RED,     "#FEE2E2"),
+        "STRONG SELL": (RED,      "#FEE2E2"),
     }
-    # Map hybrid signals
-    mapping = {
-        "STRONG BUY": "STRONG BUY", "STRONGBUY": "STRONG BUY",
+    canonical = {
+        "STRONGBUY": "STRONG BUY", "STRONG BUY": "STRONG BUY",
         "BUY": "BUY",
         "NEUTRAL": "NEUTRAL",
         "SELL": "SELL",
-        "STRONG SELL": "STRONG SELL", "STRONGSELL": "STRONG SELL",
+        "STRONGSELL": "STRONG SELL", "STRONG SELL": "STRONG SELL",
     }
-    key = mapping.get(sig.replace(" ", "").upper(), "NEUTRAL")
+    key = canonical.get(sig.replace(" ", ""), "NEUTRAL")
     fg, bg = styles.get(key, (GRAY, "#F3F4F6"))
     return (
         f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
         f'font-size:10px;font-weight:700;letter-spacing:.5px;'
-        f'color:{fg};background:{bg};border:1px solid {fg}40">'
-        f'{key}</span>'
+        f'color:{fg};background:{bg};border:1px solid {fg}40">{key}</span>'
     )
+
 
 def _impact_badge(impact):
     c = {"BULLISH": GREEN, "BEARISH": RED, "NEUTRAL": GOLD}.get(impact.upper(), GRAY)
@@ -432,49 +542,51 @@ def _impact_badge(impact):
         f'{impact.upper()}</span>'
     )
 
+
 def _dot(filled):
     return (f'<span style="color:{GREEN};font-size:12px">&#9679;</span>'
             if filled else
             f'<span style="color:{BORDER};font-size:12px">&#9675;</span>')
 
+
 def _css():
-    return """
-    <style>
-      * { box-sizing: border-box; }
-      body { margin: 0; padding: 0; background: #E9EDF2; }
-      table { border-collapse: collapse; }
-      a { color: #1a3256; }
-      @media only screen and (max-width: 600px) {
-        .wrapper { width: 100% !important; }
-        .hide-mobile { display: none !important; }
-      }
-    </style>
-    """
+    return """<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 0; background: #E9EDF2; }
+table { border-collapse: collapse; }
+a { color: #1a3256; }
+@media only screen and (max-width: 600px) {
+  .wrapper { width: 100% !important; }
+  .hide-mobile { display: none !important; }
+}
+</style>"""
+
 
 def _section_header(title, subtitle=""):
     sub = (
-        f'<div style="font-size:11px;color:#9CA3AF;margin-top:3px;'
-        f'font-style:italic">{subtitle}</div>' if subtitle else ""
+        f'<div style="font-size:11px;color:#93C5FD;margin-top:3px;'
+        f'opacity:.75;font-style:italic">{subtitle}</div>'
+        if subtitle else ""
     )
     return (
-        f'<div style="background:{NAVY};padding:12px 20px;margin-bottom:0">'
+        f'<div style="background:{NAVY};padding:12px 20px">'
         f'<div style="font-size:10px;font-weight:700;letter-spacing:2px;'
         f'color:#93C5FD;text-transform:uppercase">{title}</div>'
         f'{sub}</div>'
     )
 
 
-def build_html(summary_text, market, news_items, macro_analyses,
+def build_html(summary_text, market_narrative,
+               market, news_items, macro_analyses,
                insider_rows, cluster_buys,
                portfolio_enriched, portfolio_totals, bench,
                radar_stocks):
 
-    now         = datetime.now()
-    date_hdr    = now.strftime("%A, %B %d %Y")
-    time_hdr    = "New York Pre-Market" if now.hour < 13 else "End of Day"
-    gen_ts      = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    now      = datetime.now()
+    date_hdr = now.strftime("%A, %B %d %Y")
+    time_hdr = "New York Pre-Market" if now.hour < 13 else "End of Day"
+    gen_ts   = now.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # ── WRAPPER ──────────────────────────────────────────────────────────────
     def wrap(inner):
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -505,33 +617,34 @@ def build_html(summary_text, market, news_items, macro_analyses,
 <div style="background:{NAVY};padding:28px 32px 20px">
   <div style="font-size:11px;font-weight:700;letter-spacing:3px;
     color:#93C5FD;margin-bottom:6px">MOHAB CAPITAL</div>
-  <div style="font-size:22px;font-weight:700;color:{WHITE};
-    letter-spacing:.5px;line-height:1.2">Daily Intelligence Brief</div>
-  <div style="margin-top:12px;border-top:1px solid #1E3A5F;padding-top:12px;
-    display:flex;justify-content:space-between">
-    <span style="font-size:11px;color:#6B8CAE">{date_hdr} &nbsp;|&nbsp; {time_hdr}</span>
-    <span style="font-size:11px;color:#6B8CAE">Powered by Claude AI</span>
+  <div style="font-size:22px;font-weight:700;color:{WHITE};letter-spacing:.5px;line-height:1.2">
+    Daily Intelligence Brief</div>
+  <div style="margin-top:12px;border-top:1px solid #1E3A5F;padding-top:12px">
+    <span style="font-size:11px;color:#6B8CAE">{date_hdr} &nbsp;|&nbsp; {time_hdr}
+    &nbsp;&nbsp;&nbsp; Powered by Claude AI</span>
   </div>
 </div>
 </td></tr>
 """
 
     # ── MARKET TICKER BAR ─────────────────────────────────────────────────────
+    short_map = {
+        "S&P 500":"SPX","NASDAQ":"NDX","DOW":"DJIA","Russell 2K":"RUT",
+        "VIX":"VIX","Gold":"GOLD","WTI Oil":"OIL","10-Yr UST":"10Y",
+        "USD/EUR":"EUR","Bitcoin":"BTC",
+    }
     ticker_cells = ""
     for name, d in market.items():
         p    = d.get("price", 0.0)
         chg  = d.get("change_pct", 0.0)
         col  = GREEN if chg >= 0 else RED
         sign = "+" if chg >= 0 else ""
-        # Abbreviated names for the bar
-        short = {"S&P 500":"SPX","NASDAQ":"NDX","DOW":"DJIA",
-                 "Russell 2K":"RUT","VIX":"VIX","Gold":"GOLD",
-                 "WTI Oil":"OIL","10-Yr UST":"10Y","USD/EUR":"EUR","Bitcoin":"BTC"}.get(name, name[:4])
+        short = short_map.get(name, name[:4])
         fmt_p = f"{p:,.0f}" if p > 100 else f"{p:.2f}"
         ticker_cells += (
-            f'<td style="padding:8px 12px;border-right:1px solid #E5E7EB;'
+            f'<td style="padding:8px 10px;border-right:1px solid #E5E7EB;'
             f'white-space:nowrap;vertical-align:top">'
-            f'<div style="font-size:9px;font-weight:700;letter-spacing:1px;color:{GRAY}">{short}</div>'
+            f'<div style="font-size:8px;font-weight:700;letter-spacing:1px;color:{GRAY}">{short}</div>'
             f'<div style="font-size:12px;font-weight:700;color:#111827">{fmt_p}</div>'
             f'<div style="font-size:10px;font-weight:600;color:{col}">{sign}{chg:.2f}%</div>'
             f'</td>'
@@ -550,11 +663,28 @@ def build_html(summary_text, market, news_items, macro_analyses,
     # ── EXECUTIVE SUMMARY ─────────────────────────────────────────────────────
     rows += f"""
 <tr><td style="padding-top:20px">
-{_section_header("EXECUTIVE SUMMARY", "AI-generated market intelligence")}
+{_section_header("EXECUTIVE SUMMARY", "AI-generated | 3-sentence brief")}
 <div style="background:{WHITE};padding:20px 24px;border:1px solid {BORDER};border-top:none">
-  <div style="font-size:14px;line-height:1.75;color:#1F2937;font-style:italic">
+  <div style="font-size:14px;line-height:1.8;color:#1F2937;font-style:italic">
     {summary_text}
   </div>
+</div>
+</td></tr>
+"""
+
+    # ── MARKET NARRATIVE ─────────────────────────────────────────────────────
+    if market_narrative:
+        # Split into paragraphs
+        paras = [p.strip() for p in market_narrative.split("\n\n") if p.strip()]
+        para_html = "".join(
+            f'<p style="margin:0 0 14px 0;font-size:13px;line-height:1.8;color:#1F2937">{p}</p>'
+            for p in paras
+        )
+        rows += f"""
+<tr><td style="padding-top:20px">
+{_section_header("MARKET NARRATIVE", "Goldman Sachs-style morning brief — written by Claude AI")}
+<div style="background:{WHITE};padding:20px 24px;border:1px solid {BORDER};border-top:none">
+  {para_html}
 </div>
 </td></tr>
 """
@@ -563,43 +693,42 @@ def build_html(summary_text, market, news_items, macro_analyses,
     rows += f"""
 <tr><td style="padding-top:20px">
 {_section_header("MARKET-MOVING DEVELOPMENTS",
-                 "Events with potential portfolio impact — assessed by AI")}
+                 "Macro events with portfolio impact — filtered & analyzed by AI")}
 <div style="background:{WHITE};border:1px solid {BORDER};border-top:none">
 """
     for i, (item, analysis) in enumerate(zip(news_items, macro_analyses)):
-        bg = WHITE if i % 2 == 0 else GRAY_LT
+        bg       = WHITE if i % 2 == 0 else GRAY_LT
         impact   = analysis.get("IMPACT", "NEUTRAL")
         sectors  = analysis.get("SECTORS", "Broad Market")
-        ai_note  = analysis.get("ANALYSIS", "")
-        relevance= analysis.get("RELEVANCE", "MEDIUM")
+        ai_text  = analysis.get("ANALYSIS", "")
+        relevance = analysis.get("RELEVANCE", "MEDIUM")
         rel_dots = (
-            _dot(True) + "&nbsp;" + _dot(True) + " HIGH"
+            _dot(True) + "&nbsp;" + _dot(True) + "&nbsp;HIGH"
             if relevance == "HIGH"
-            else _dot(True) + "&nbsp;" + _dot(False) + " MEDIUM"
+            else _dot(True) + "&nbsp;" + _dot(False) + "&nbsp;MEDIUM"
         )
 
-        # Format pub date nicely
         pub = item.get("pub", "")
         try:
             from email.utils import parsedate_to_datetime
             dt = parsedate_to_datetime(pub)
-            mins_ago = int((datetime.now(dt.tzinfo) - dt).total_seconds() / 60)
-            pub_str = (f"{mins_ago}m ago" if mins_ago < 120
-                       else f"{mins_ago//60}h ago" if mins_ago < 1440
+            mins = int((datetime.now(dt.tzinfo) - dt).total_seconds() / 60)
+            pub_str = (f"{mins}m ago" if mins < 120
+                       else f"{mins//60}h ago" if mins < 1440
                        else dt.strftime("%b %d"))
         except Exception:
             pub_str = pub[:16] if pub else ""
 
         rows += f"""
-  <div style="padding:14px 20px;background:{bg};border-bottom:1px solid {BORDER}">
+  <div style="padding:16px 20px;background:{bg};border-bottom:1px solid {BORDER}">
     <div style="font-size:13px;font-weight:700;color:#111827;line-height:1.4;
       margin-bottom:5px">{item['title']}</div>
-    <div style="font-size:10px;color:{GRAY};margin-bottom:8px">
+    <div style="font-size:10px;color:{GRAY};margin-bottom:10px">
       Yahoo Finance &nbsp;&middot;&nbsp; {pub_str}
     </div>
-    <table width="100%" cellpadding="0" cellspacing="0">
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px">
     <tr>
-      <td style="font-size:10px;color:{GRAY};padding-right:16px">
+      <td style="font-size:10px;color:{GRAY}">
         <span style="font-weight:700;color:#374151">Impact:</span>&nbsp;
         {_impact_badge(impact)}&nbsp;
         <span style="color:{GRAY}">for {sectors}</span>
@@ -609,7 +738,9 @@ def build_html(summary_text, market, news_items, macro_analyses,
       </td>
     </tr>
     </table>
-    {"<div style='font-size:11px;color:#4B5563;margin-top:7px;font-style:italic'>Analysis: " + ai_note + "</div>" if ai_note else ""}
+    <div style="font-size:12px;color:#374151;line-height:1.7;
+      padding:10px 14px;background:{'#F0F7FF' if i % 2 == 0 else '#EBF4FF'};
+      border-left:3px solid #3B82F6;border-radius:0 4px 4px 0">{ai_text}</div>
   </div>
 """
     rows += "</div></td></tr>\n"
@@ -618,28 +749,26 @@ def build_html(summary_text, market, news_items, macro_analyses,
     rows += f"""
 <tr><td style="padding-top:20px">
 {_section_header("INSTITUTIONAL & INSIDER SIGNALS",
-                 "Material transactions by C-suite executives — open market only")}
+                 "Open-market purchases by C-suite executives — last 30 days")}
 <div style="background:{WHITE};border:1px solid {BORDER};border-top:none">
 """
-    # Cluster buy alerts
     for tk, count in cluster_buys.items():
         combined = sum(r["value"] for r in insider_rows if r["ticker"] == tk)
         rows += (
             f'<div style="background:#FFFBEB;border-left:4px solid {GOLD};'
-            f'padding:12px 20px;margin:8px;border-radius:4px">'
-            f'<span style="font-size:11px;font-weight:700;color:{GOLD};letter-spacing:1px">'
-            f'CLUSTER BUY DETECTED &mdash; {tk}</span><br>'
-            f'<span style="font-size:11px;color:#92400E">'
+            f'padding:12px 20px;margin:8px;border-radius:0 4px 4px 0">'
+            f'<div style="font-size:11px;font-weight:700;color:{GOLD};letter-spacing:1px;'
+            f'margin-bottom:3px">CLUSTER BUY DETECTED &mdash; {tk}</div>'
+            f'<div style="font-size:11px;color:#92400E">'
             f'{count} executives purchased shares in the past 30 days. '
-            f'Combined value: ${combined/1e6:.1f}M. Historically bullish signal.</span>'
+            f'Combined value: ${combined/1e6:.1f}M. Historically bullish signal.</div>'
             f'</div>'
         )
 
     if insider_rows:
         rows += """
   <table width="100%" cellpadding="0" cellspacing="0">
-  <thead>
-  <tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
+  <thead><tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:left;text-transform:uppercase">TICKER</th>
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
@@ -652,9 +781,7 @@ def build_html(summary_text, market, news_items, macro_analyses,
       color:#6B7280;text-align:center;text-transform:uppercase">DATE</th>
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:center;text-transform:uppercase">SIGNAL</th>
-  </tr>
-  </thead>
-  <tbody>
+  </tr></thead><tbody>
 """
         for i, r in enumerate(insider_rows):
             bg = WHITE if i % 2 == 0 else GRAY_LT
@@ -665,8 +792,8 @@ def build_html(summary_text, market, news_items, macro_analyses,
     <td style="padding:10px 14px;font-weight:700;font-size:12px;color:{NAVY}">{r['ticker']}</td>
     <td style="padding:10px 14px;font-size:11px;color:#111827">{r['name']}</td>
     <td class="hide-mobile" style="padding:10px 14px;font-size:10px;color:{GRAY}">{r['title']}</td>
-    <td style="padding:10px 14px;font-size:12px;font-weight:700;color:{GREEN};
-      text-align:right">{val_fmt}</td>
+    <td style="padding:10px 14px;font-size:12px;font-weight:700;
+      color:{GREEN};text-align:right">{val_fmt}</td>
     <td style="padding:10px 14px;font-size:10px;color:{GRAY};text-align:center">{r['date']}</td>
     <td style="padding:10px 14px;text-align:center">{_sig_badge('BUY')}</td>
   </tr>
@@ -687,49 +814,50 @@ def build_html(summary_text, market, news_items, macro_analyses,
 <div style="background:{WHITE};border:1px solid {BORDER};border-top:none">
 """
     if portfolio_enriched and portfolio_totals:
-        t = portfolio_totals
-        sp_ytd  = (bench or {}).get("sp500", {}).get("return_ytd", 0) if bench else 0
-        port_ytd = t.get("sheet_pnl_pct") or t.get("total_unrealized_pnl_pct") or 0
-        alpha    = (port_ytd - sp_ytd) if sp_ytd else 0
-        total_mv = t.get("total_portfolio_value") or t.get("total_market_value") or 0
-        tot_pnl  = t.get("total_unrealized_pnl") or 0
-        tot_pct  = t.get("total_unrealized_pnl_pct") or 0
+        t        = portfolio_totals
+        sp_ytd   = (bench or {}).get("sp500", {}).get("return_ytd", 0.0) if bench else 0.0
+        port_ytd = t.get("sheet_pnl_pct") or t.get("total_unrealized_pnl_pct") or 0.0
+        # FIX: convert percentage-point difference to basis points correctly
+        alpha_bps = int(round((port_ytd - sp_ytd) * 100)) if sp_ytd else 0
+        total_mv  = t.get("total_portfolio_value") or t.get("total_market_value") or 0
+        tot_pnl   = t.get("total_unrealized_pnl") or 0
+        tot_cost  = t.get("total_cost") or 0
+        # FIX: always compute pct from dollar P&L for consistency
+        tot_pct   = (tot_pnl / tot_cost * 100) if tot_cost else 0.0
 
         pnl_col   = GREEN if tot_pnl  >= 0 else RED
-        alpha_col = GREEN if alpha    >= 0 else RED
+        alpha_col = GREEN if alpha_bps >= 0 else RED
 
-        # Summary row
         rows += f"""
-  <div style="background:{NAVY};padding:14px 20px">
+  <div style="background:{NAVY};padding:16px 24px">
   <table width="100%" cellpadding="0" cellspacing="0">
   <tr>
-    <td style="padding:0 20px 0 0">
+    <td style="padding-right:24px">
       <div style="font-size:9px;font-weight:700;letter-spacing:1.5px;color:#93C5FD">
         TOTAL VALUE</div>
-      <div style="font-size:18px;font-weight:700;color:{WHITE}">${total_mv:,.0f}</div>
+      <div style="font-size:20px;font-weight:700;color:{WHITE}">${total_mv:,.0f}</div>
     </td>
-    <td style="padding:0 20px;border-left:1px solid #1E3A5F">
+    <td style="padding:0 24px;border-left:1px solid #1E3A5F">
       <div style="font-size:9px;font-weight:700;letter-spacing:1.5px;color:#93C5FD">
         UNREALIZED P&amp;L</div>
-      <div style="font-size:18px;font-weight:700;color:{pnl_col}">
-        {"+" if tot_pnl >= 0 else ""}{tot_pnl:,.0f} ({tot_pct:+.1f}%)</div>
+      <div style="font-size:20px;font-weight:700;color:{pnl_col}">
+        {"+" if tot_pnl >= 0 else ""}{tot_pnl:,.0f}
+        <span style="font-size:13px">({tot_pct:+.1f}%)</span></div>
     </td>
-    <td style="padding:0 0 0 20px;border-left:1px solid #1E3A5F">
+    <td style="padding-left:24px;border-left:1px solid #1E3A5F">
       <div style="font-size:9px;font-weight:700;letter-spacing:1.5px;color:#93C5FD">
-        YTD vs S&P 500</div>
-      <div style="font-size:18px;font-weight:700;color:{alpha_col}">
+        YTD vs S&amp;P 500</div>
+      <div style="font-size:20px;font-weight:700;color:{alpha_col}">
         {port_ytd:+.1f}% vs {sp_ytd:+.1f}%
-        <span style="font-size:12px">({alpha:+.0f}bps)</span></div>
+        <span style="font-size:12px">({alpha_bps:+d}bps)</span></div>
     </td>
   </tr>
   </table>
   </div>
 """
-        # Holdings table
         rows += """
   <table width="100%" cellpadding="0" cellspacing="0">
-  <thead>
-  <tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
+  <thead><tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
     <th style="padding:10px 12px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:left;text-transform:uppercase">TICKER</th>
     <th class="hide-mobile" style="padding:10px 12px;font-size:9px;font-weight:700;
@@ -746,19 +874,20 @@ def build_html(summary_text, market, news_items, macro_analyses,
       color:#6B7280;text-align:right;text-transform:uppercase">P&amp;L %</th>
     <th style="padding:10px 12px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:center;text-transform:uppercase">SIGNAL</th>
-  </tr>
-  </thead>
-  <tbody>
+  </tr></thead><tbody>
 """
-        sorted_holdings = sorted(portfolio_enriched, key=lambda x: x.get("market_value", 0), reverse=True)
-        for i, r in enumerate(sorted_holdings):
+        sorted_h = sorted(portfolio_enriched, key=lambda x: x.get("market_value", 0), reverse=True)
+        for i, r in enumerate(sorted_h):
             bg     = WHITE if i % 2 == 0 else GRAY_LT
-            pnl_d  = r.get("unrealized_pnl", 0) or 0
-            pnl_p  = r.get("unrealized_pnl_pct", 0) or r.get("pnl_pct", 0) or 0
-            mv     = r.get("market_value", 0) or 0
-            price  = r.get("price", 0) or 0
-            shares = r.get("shares", 0) or 0
-            cost   = r.get("cost_basis", 0) or 0
+            shares = float(r.get("shares", 0) or 0)
+            # FIX: use cost_basis_ps (per-share cost from Google Sheets)
+            cost   = float(r.get("cost_basis_ps", 0) or 0)
+            price  = float(r.get("price", 0) or 0)
+            mv     = shares * price
+            tc     = shares * cost
+            # FIX: always compute both P&L values from the same source
+            pnl_d  = mv - tc
+            pnl_p  = (pnl_d / tc * 100) if tc else 0.0
             sig    = r.get("signal", "NEUTRAL")
             pc     = GREEN if pnl_d >= 0 else RED
             rows += f"""
@@ -793,8 +922,7 @@ def build_html(summary_text, market, news_items, macro_analyses,
 {_section_header("WATCHLIST — TOP OPPORTUNITIES", "Ranked by Hybrid Score")}
 <div style="background:{WHITE};border:1px solid {BORDER};border-top:none">
   <table width="100%" cellpadding="0" cellspacing="0">
-  <thead>
-  <tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
+  <thead><tr style="background:#F9FAFB;border-bottom:2px solid #E5E7EB">
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:left;text-transform:uppercase">TICKER</th>
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
@@ -807,34 +935,31 @@ def build_html(summary_text, market, news_items, macro_analyses,
       letter-spacing:1.5px;color:#6B7280;text-align:center;text-transform:uppercase">EARNINGS</th>
     <th style="padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.5px;
       color:#6B7280;text-align:left;text-transform:uppercase">NOTE</th>
-  </tr>
-  </thead>
-  <tbody>
+  </tr></thead><tbody>
 """
     for i, r in enumerate(radar_stocks):
-        bg = WHITE if i % 2 == 0 else GRAY_LT
-        score_pct = int(float(r["score"]) * 10)  # out of 100
-        bar_col   = GREEN if float(r["score"]) >= 6.5 else (GOLD if float(r["score"]) >= 5 else RED)
-        upside    = r.get("upside", "N/A")
-        if upside not in (None, "N/A", "") and upside != "N/A":
-            try:
-                upside = f"{float(upside):+.1f}%"
-            except Exception:
-                pass
+        bg    = WHITE if i % 2 == 0 else GRAY_LT
+        score = float(r["score"])
+        bar_w = int(score * 10)
+        bar_c = GREEN if score >= 6.5 else (GOLD if score >= 5 else RED)
+        up    = r.get("upside", "N/A")
+        try:
+            up = f"{float(up):+.1f}%" if up not in (None, "N/A", "") else "N/A"
+        except Exception:
+            pass
         rows += f"""
   <tr style="background:{bg};border-bottom:1px solid #F3F4F6">
     <td style="padding:10px 14px;font-weight:700;font-size:12px;color:{NAVY}">{r['ticker']}</td>
     <td style="padding:10px 14px;text-align:center">
       <div style="font-size:12px;font-weight:700;color:#111827">{r['score']}/10</div>
       <div style="width:60px;height:4px;background:#E5E7EB;border-radius:2px;
-        margin:3px auto 0;overflow:hidden">
-        <div style="width:{score_pct}%;height:100%;background:{bar_col};
-          border-radius:2px"></div>
+        margin:3px auto;overflow:hidden">
+        <div style="width:{bar_w}%;height:100%;background:{bar_c};border-radius:2px"></div>
       </div>
     </td>
     <td style="padding:10px 14px;text-align:center">{_sig_badge(r['signal'])}</td>
     <td class="hide-mobile" style="padding:10px 14px;font-size:11px;
-      font-weight:700;color:{GREEN};text-align:right">{upside}</td>
+      font-weight:700;color:{GREEN};text-align:right">{up}</td>
     <td class="hide-mobile" style="padding:10px 14px;font-size:10px;
       color:{GRAY};text-align:center">{r.get('earnings','N/A')}</td>
     <td style="padding:10px 14px;font-size:10px;color:{GRAY}">{r.get('note','')}</td>
@@ -855,13 +980,10 @@ def build_html(summary_text, market, news_items, macro_analyses,
     mohab2056@gmail.com &nbsp;&middot;&nbsp;
     Riyadh, Saudi Arabia
   </div>
-  <div style="font-size:9px;color:#D1D5DB;margin-top:6px">
-    Generated {gen_ts}
-  </div>
+  <div style="font-size:9px;color:#D1D5DB;margin-top:6px">Generated {gen_ts}</div>
 </div>
 </td></tr>
 """
-
     return wrap(rows)
 
 
@@ -872,19 +994,19 @@ def send_email(html_body):
         print("  ERROR: GMAIL_APP_PASSWORD not configured.")
         return False
 
-    now    = datetime.now()
+    now     = datetime.now()
     subject = f"Mohab Capital | Daily Intelligence Brief — {now.strftime('%B %d, %Y')}"
 
-    msg           = MIMEMultipart("alternative")
-    msg["Subject"]= subject
-    msg["From"]   = SENDER_EMAIL
-    msg["To"]     = RECEIVER_EMAIL
+    msg            = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SENDER_EMAIL
+    msg["To"]      = RECEIVER_EMAIL
     msg.attach(MIMEText(html_body, "html"))
 
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.verify_mode    = ssl.CERT_NONE
         with smtplib.SMTP("smtp.gmail.com", 587) as srv:
             srv.ehlo()
             srv.starttls(context=ctx)
@@ -909,45 +1031,48 @@ def run(send=True, save=True):
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
-    print("\n  [1/6] Fetching market overview...")
-    market    = fetch_market_overview()
+    print("\n  [1/7] Fetching market overview...")
+    market     = fetch_market_overview()
     benchmarks = fetch_ytd_benchmarks()
     print(f"        {len(market)} instruments loaded")
 
-    print("  [2/6] Fetching macro news...")
+    print("  [2/7] Fetching macro news (filtered)...")
     news_items = fetch_macro_news(max_items=6)
-    print(f"        {len(news_items)} headlines")
+    print(f"        {len(news_items)} macro headlines")
 
-    print("  [3/6] Fetching portfolio from Google Sheets...")
-    port_result = fetch_portfolio()
-    if len(port_result) == 6:
-        port_enriched, positions, cash, pnl_pct, bench, port_totals = port_result
-    else:
-        port_enriched, positions, cash, pnl_pct, bench = port_result
-        port_totals = {}
+    print("  [3/7] Fetching portfolio from Google Sheets...")
+    port_enriched, positions, cash, pnl_pct, bench, port_totals = fetch_portfolio()
     print(f"        {len(port_enriched)} holdings loaded")
 
-    print("  [4/6] Fetching insider activity...")
+    print("  [4/7] Fetching insider activity...")
     all_tickers = list(positions.keys()) if positions else [
         "CRWV","GOOGL","NVDA","AMD","INTC","MU","GDX","SPUS","TIGO"
     ]
-    insider_rows  = fetch_insider_activity(all_tickers)
-    cluster_buys  = detect_cluster_buys(insider_rows)
+    insider_rows = fetch_insider_activity(all_tickers)
+    cluster_buys = detect_cluster_buys(insider_rows)
     print(f"        {len(insider_rows)} transactions, {len(cluster_buys)} cluster buys")
 
-    print("  [5/6] Fetching radar / watchlist...")
+    print("  [5/7] Fetching radar / watchlist...")
     radar_stocks = fetch_radar_top(5)
     print(f"        {len(radar_stocks)} top opportunities")
 
-    print("  [6/6] Generating AI analysis...")
-    ai_tag = "Claude AI" if ANTHROPIC_KEY else "rule-based fallback (set ANTHROPIC_API_KEY)"
-    print(f"        Using {ai_tag}")
-    summary_text  = generate_executive_summary(market, benchmarks, port_totals, insider_rows)
-    macro_analyses = [generate_macro_analysis(item["title"]) for item in news_items]
+    ai_tag = "Claude API (claude-sonnet-4-6)" if ANTHROPIC_KEY else "rule-based fallback"
+    print(f"  [6/7] Generating executive summary ({ai_tag})...")
+    summary_text = generate_executive_summary(market, benchmarks, port_totals, insider_rows)
+
+    print(f"  [7/7] Generating market narrative + {len(news_items)} macro analyses ({ai_tag})...")
+    market_narrative = generate_market_narrative(
+        market, news_items, port_enriched, port_totals, bench, radar_stocks
+    )
+    macro_analyses = [
+        generate_macro_analysis(item["title"], all_tickers)
+        for item in news_items
+    ]
 
     print("\n  Building HTML report...")
     html = build_html(
-        summary_text, market, news_items, macro_analyses,
+        summary_text, market_narrative,
+        market, news_items, macro_analyses,
         insider_rows, cluster_buys,
         port_enriched, port_totals, bench,
         radar_stocks,
@@ -960,18 +1085,17 @@ def run(send=True, save=True):
 
     if send:
         print("  Sending email...")
-        success = send_email(html)
-        if success:
+        ok = send_email(html)
+        if ok:
             print(f"\n  CONFIRMATION: Report delivered to {RECEIVER_EMAIL}")
         else:
             print("\n  FAILED: Email not sent.")
     else:
-        success = True
+        ok = True
 
-    elapsed = time.time() - t0
-    print(f"\n  Done in {elapsed:.1f}s")
+    print(f"\n  Done in {time.time() - t0:.1f}s")
     print("="*60 + "\n")
-    return success
+    return ok
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
