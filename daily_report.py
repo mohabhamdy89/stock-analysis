@@ -874,7 +874,31 @@ def send_email(html_body: str) -> bool:
 
 # ── 8. Main ────────────────────────────────────────────────────────────────────
 
-def run(send=True, save=True):
+# NYSE holidays 2025-2027 (add future years as needed)
+_NYSE_HOLIDAYS = {
+    # 2025
+    "2025-01-01","2025-01-20","2025-02-17","2025-04-18",
+    "2025-05-26","2025-06-19","2025-07-04","2025-09-01",
+    "2025-11-27","2025-12-25",
+    # 2026
+    "2026-01-01","2026-01-19","2026-02-16","2026-04-03",
+    "2026-05-25","2026-06-19","2026-07-03","2026-09-07",
+    "2026-11-26","2026-12-25",
+    # 2027
+    "2027-01-01","2027-01-18","2027-02-15","2027-03-26",
+    "2027-05-31","2027-06-18","2027-07-05","2027-09-06",
+    "2027-11-25","2027-12-24",
+}
+
+def _is_trading_day(dt=None):
+    """Return True if dt (default: today) is a US market weekday and not a NYSE holiday."""
+    dt = dt or datetime.now()
+    if dt.weekday() >= 5:           # 5=Sat, 6=Sun
+        return False
+    return dt.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
+
+
+def run(send=True, save=True, force=False):
     t0 = time.time()
     print("\n" + "="*60)
     print("  MOHAB CAPITAL | DAILY INTELLIGENCE BRIEF")
@@ -882,6 +906,13 @@ def run(send=True, save=True):
     ai_mode = "Claude API (claude-sonnet-4-6)" if ANTHROPIC_KEY else "rule-based fallback (ANTHROPIC_API_KEY not set)"
     print(f"  AI: {ai_mode}")
     print("="*60)
+
+    # Skip weekends and market holidays unless forced
+    if not force and not _is_trading_day():
+        day = datetime.now().strftime("%A %Y-%m-%d")
+        print(f"\n  SKIPPED: {day} is not a US trading day. Use --force to override.\n")
+        print("="*60 + "\n")
+        return True
 
     print("\n  [1/8] Market snapshot...")
     market = fetch_market_snapshot()
@@ -943,5 +974,6 @@ def run(send=True, save=True):
 
 
 if __name__ == "__main__":
-    do_send = "--save" not in sys.argv
-    run(send=do_send, save=True)
+    do_send  = "--save" not in sys.argv
+    do_force = "--force" in sys.argv
+    run(send=do_send, save=True, force=do_force)
